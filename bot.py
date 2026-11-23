@@ -29,6 +29,7 @@ if GPU:
 ort.set_default_logger_severity(3)  # errors only
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.audio.vad.vad_analyzer import VADParams, VADState
 from pipecat.frames.frames import LLMRunFrame
 from pipecat.observers.user_bot_latency_observer import UserBotLatencyObserver
 from pipecat.pipeline.pipeline import Pipeline
@@ -42,6 +43,36 @@ from pipecat.services.kokoro.tts import KokoroTTSService
 from pipecat.services.whisper.stt import WhisperSTTService
 from pipecat.transports.base_transport import TransportParams
 from pipecat.workers.runner import WorkerRunner
+
+# Background sound. In a first live test the bot treated a noisy room as one long caller turn and was
+# interrupted 28 times in 11 minutes.
+#
+# MIN_VOLUME: the loudness score (0 to 1) a frame needs before it can count as speech. Pipecat's default
+# is 0.6. Measured with this VAD: a voice at normal level scores about 0.81, half as loud 0.75, a quarter
+# 0.69, and ten times quieter still 0.61, so the default lets distant voices through. The speech-confidence
+# score cannot do this job: it stays near 1.0 even for a voice fifty times quieter.
+# In the next live test the caller's own speech peaked at 0.82 to 0.96 and nothing else was picked up.
+# Raise it if far voices still get through; lower it if the bot ignores you. The log prints the loudness
+# of every stretch of speech it accepts.
+#
+# Tried and removed: requiring three recognised words before a turn could start (MinWordsUserTurnStartStrategy).
+# It made a turn start only once its transcript arrived, which added a fixed 0.8 s wait to every reply.
+MIN_VOLUME = 0.72
+
+
+class LoudnessLoggingVAD(SileroVADAnalyzer):
+    """Silero VAD that also logs how loud each accepted stretch of speech was, for tuning MIN_VOLUME."""
+
+    _peak = None
+
+    async def analyze_audio(self, buffer):
+        state = await super().analyze_audio(buffer)
+        if state in (VADState.SPEAKING, VADState.STOPPING):
+            self._peak = max(self._peak or 0.0, self._prev_volume)  # ponytail: reads a private field of the analyzer
+        elif self._peak is not None:
+            logger.info(f"speech ended, loudness peak {self._peak:.2f} (MIN_VOLUME {MIN_VOLUME})")
+            self._peak = None
+        return state
 
 
 async def bot(runner_args: RunnerArguments):
@@ -68,7 +99,8 @@ async def bot(runner_args: RunnerArguments):
     # The conversation history, and the two processors that write the caller's and the bot's turns into it.
     context = LLMContext()
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
-        context, user_params=LLMUserAggregatorParams(vad_analyzer=SileroVADAnalyzer())
+        context,
+        user_params=LLMUserAggregatorParams(vad_analyzer=LoudnessLoggingVAD(params=VADParams(min_volume=MIN_VOLUME))),
     )
 
     pipeline = Pipeline([
