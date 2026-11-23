@@ -12,15 +12,34 @@ supplies what that file had to implement:
     interrupt() and Turn    -> built-in interruption handling
     sentences() + play_queue-> the TTS service's own text aggregation and playout
     the timing line         -> UserBotLatencyObserver
+
+Phase 5 adds tools (tools.py): the receptionist can check free times, book and reschedule
+appointments, and hang up when the caller is done.
 """
 import os
+from datetime import date
 
 import ctranslate2
 import onnxruntime as ort
 from loguru import logger
 
 # Importing voice_loop also puts the NVIDIA DLLs on PATH, which Whisper needs here too.
-from voice_loop import MODEL, MODELS_DIR, SYSTEM, VOICE
+from tools import TOOLS
+from voice_loop import MODEL, MODELS_DIR, VOICE
+
+SYSTEM = (
+    "You are the receptionist at Bright Smile Dental, answering a phone call. Your words are spoken aloud, so "
+    "reply in one or two short sentences of plain speech: no lists, no markdown, no emoji. Never answer with "
+    "silence. "
+    "You can check free times, book appointments and reschedule them with your tools. The clinic is open Monday "
+    "to Friday, 9 AM to 5 PM, and appointments start on the hour or the half hour. "
+    "Only offer times that check_availability returned, and offer at most three at once. "
+    "To book you need the caller's name, phone number, the reason for the visit and a time. Speech recognition "
+    "mishears names and numbers, so read both back and get a clear yes before you book. "
+    "If a tool reports a problem, tell the caller plainly and suggest an alternative. "
+    "When the caller has nothing more to ask, call end_call with your goodbye; it says it and hangs up. "
+    "Today is {today:%A} {today.day} {today:%B} {today.year}."
+)
 
 GPU = "CUDAExecutionProvider" in ort.get_available_providers()
 if GPU:
@@ -88,7 +107,7 @@ async def bot(runner_args: RunnerArguments):
     )
     llm = AnthropicLLMService(
         api_key=os.environ["ANTHROPIC_API_KEY"],
-        settings=AnthropicLLMService.Settings(model=MODEL, system_instruction=SYSTEM),
+        settings=AnthropicLLMService.Settings(model=MODEL, system_instruction=SYSTEM.format(today=date.today())),
     )
     tts = KokoroTTSService(
         model_path=os.path.join(MODELS_DIR, "kokoro-v1.0.onnx"),
@@ -97,7 +116,7 @@ async def bot(runner_args: RunnerArguments):
     )
 
     # The conversation history, and the two processors that write the caller's and the bot's turns into it.
-    context = LLMContext()
+    context = LLMContext(tools=TOOLS)  # Pipecat reads each tool's signature and docstring and registers it
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
         context,
         user_params=LLMUserAggregatorParams(vad_analyzer=LoudnessLoggingVAD(params=VADParams(min_volume=MIN_VOLUME))),
