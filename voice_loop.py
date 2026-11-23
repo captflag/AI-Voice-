@@ -1,14 +1,17 @@
-"""Phase 1: the naive voice loop.
+"""Voice loop, phase 2: streaming.
 
     mic -> endpointing (VAD) -> speech-to-text -> LLM -> text-to-speech -> speaker
 
-Turn-based and blocking on purpose. Every stage is timed, so you can see where
-the delay comes from before phase 2 starts removing it.
+Still turn-based, but the LLM reply is streamed and spoken sentence by sentence,
+so the caller hears the first sentence while the rest is being written.
+Every stage is timed.
 
     python voice_loop.py           talk to it (Ctrl+C to quit)
     python voice_loop.py --check   test the pieces without a mic or an API key
 """
+import glob
 import os
+import re
 import sys
 import tempfile
 import time
@@ -17,8 +20,12 @@ from collections import deque
 from contextlib import closing
 
 os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")  # quiet a harmless Windows notice on model download
+# pip puts the NVIDIA DLLs inside the venv, where Windows only finds them through PATH.
+for _dll_dir in glob.glob(os.path.join(sys.prefix, "Lib", "site-packages", "nvidia", "*", "bin")):
+    os.environ["PATH"] = _dll_dir + os.pathsep + os.environ["PATH"]
 
 import anthropic
+import ctranslate2
 import numpy as np
 import pyttsx3
 import sounddevice as sd
@@ -31,7 +38,8 @@ PRE_ROLL = 10         # frames kept from before speech started, so word onsets a
 MIN_LOUD = 5          # fewer loud frames than this is a click or a cough, not speech
 MAX_FRAMES = 1000     # 30 s cap on one utterance
 MIN_THRESHOLD = 0.01  # loudness floor for "speech". Raise it if noise triggers recordings.
-MODEL = "claude-opus-5-5"
+MODEL = "claude-haiku-5-5"  # measured: first sentence in ~750 ms, vs ~1,190 ms on claude-opus-5-5
+SENTENCE_END = re.compile(r"(?<=[.!?])\s+")
 SYSTEM = (
     "You are the receptionist at Bright Smile Dental, answering a phone call. "
     "Your words are spoken aloud, so reply in one or two short sentences of plain "
@@ -78,7 +86,9 @@ def mic_frames():
 
 
 def load_stt():
-    # ponytail: small model on CPU. Phase 2 measures GPU and larger models against it.
+    # Measured on a GTX 1660, 1.7 s clip: GPU 110 ms, CPU 641 ms. small.en on GPU: 338 ms.
+    if ctranslate2.get_cuda_device_count():
+        return WhisperModel("base.en", device="cuda", compute_type="float32")
     return WhisperModel("base.en", device="cpu", compute_type="int8")
 
 
@@ -87,22 +97,37 @@ def transcribe(stt, audio):
     return " ".join(s.text.strip() for s in segments).strip()
 
 
+def sentences(chunks):
+    """Regroup a stream of text chunks into whole sentences, yielding each as soon as it ends.
+
+    ponytail: splits on . ! ? followed by a space, so "Dr. Lee" splits early.
+    The pieces are spoken back to back, so the cost is a slightly odd pause.
+    """
+    buf = ""
+    for chunk in chunks:
+        *done, buf = SENTENCE_END.split(buf + chunk)
+        yield from done
+    if buf.strip():
+        yield buf.strip()
+
+
 def ask(llm, history, text):
+    """Yield the reply one sentence at a time, while the model is still writing the rest."""
     history.append({"role": "user", "content": text})
-    resp = llm.beta.messages.create(
+    with llm.messages.stream(
         model=MODEL,
         max_tokens=16000,
         system=SYSTEM,
         output_config={"effort": "low"},  # least thinking, fastest reply
-        betas=["server-side-fallback-2026-07-01"],
-        fallbacks="default",  # if the model declines, the API retries on a fallback model
         messages=history,
-    )
+    ) as stream:
+        yield from sentences(stream.text_stream)
+        resp = stream.get_final_message()
     if resp.stop_reason == "refusal":
         history.pop()
-        return "Sorry, I can't help with that."
-    history.append({"role": "assistant", "content": resp.content})  # whole content, not just the text
-    return " ".join(b.text for b in resp.content if b.type == "text")
+        yield "Sorry, I can't help with that."
+    else:
+        history.append({"role": "assistant", "content": resp.content})  # whole content, not just the text
 
 
 def speak(text):
@@ -133,13 +158,15 @@ def main():
         if not text:
             continue
         print("you:", text)
-        reply = ask(llm, history, text)
-        t2 = time.perf_counter()
-        print("bot:", reply)
-        wait, stt_ms, llm_ms = SILENCE_FRAMES * 30, (t1 - t0) * 1000, (t2 - t1) * 1000
-        print(f"     [silence wait {wait} ms | stt {stt_ms:.0f} ms | llm {llm_ms:.0f} ms"
+        print("bot:", end=" ", flush=True)
+        first = None
+        for sentence in ask(llm, history, text):  # speak each sentence as soon as it is written
+            first = first or time.perf_counter()
+            print(sentence, end=" ", flush=True)
+            speak(sentence)
+        wait, stt_ms, llm_ms = SILENCE_FRAMES * 30, (t1 - t0) * 1000, ((first or time.perf_counter()) - t1) * 1000
+        print(f"\n     [silence wait {wait} ms | stt {stt_ms:.0f} ms | llm first sentence {llm_ms:.0f} ms"
               f" | reply starts {wait + stt_ms + llm_ms:.0f} ms after you stopped]\n")
-        speak(reply)
 
 
 def check():
@@ -149,6 +176,10 @@ def check():
     out = capture(iter(frames), MIN_THRESHOLD)
     assert len(out) == (PRE_ROLL + 19 + SILENCE_FRAMES) * FRAME, len(out) / FRAME
     print("endpointing ok")
+
+    # Sentence regrouping: chunk boundaries fall anywhere, sentences come out whole.
+    assert list(sentences(["Hi the", "re. How are", " you? Bye"])) == ["Hi there.", "How are you?", "Bye"]
+    print("sentence streaming ok")
 
     # Text-to-speech into a file, then speech-to-text back out of it.
     path = os.path.join(tempfile.gettempdir(), "voice_loop_check.wav")
