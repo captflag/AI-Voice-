@@ -19,6 +19,7 @@ appointments, and hang up when the caller is done.
 import os
 from datetime import date
 
+import aiohttp
 import ctranslate2
 import onnxruntime as ort
 from loguru import logger
@@ -63,6 +64,7 @@ from pipecat.services.anthropic.llm import AnthropicLLMService
 from pipecat.services.kokoro.tts import KokoroTTSService
 from pipecat.services.whisper.stt import WhisperSTTService
 from pipecat.transports.base_transport import TransportParams
+from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams
 from pipecat.workers.runner import WorkerRunner
 
 # Background sound. In a first live test the bot treated a noisy room as one long caller turn and was
@@ -96,16 +98,48 @@ class LoudnessLoggingVAD(SileroVADAnalyzer):
         return state
 
 
+async def caller_number(call):
+    """The phone number a Twilio call came from, or None if it cannot be found.
+
+    Twilio sends it with the call only when the TwiML passes it as a stream parameter. The development
+    runner's TwiML does not, so the usual route is to look the call up through Twilio's REST API.
+    """
+    if call.from_number:
+        return call.from_number
+    sid, token = os.getenv("TWILIO_ACCOUNT_SID"), os.getenv("TWILIO_AUTH_TOKEN")
+    if not (sid and token and call.call_id):
+        return None
+    url = f"https://api.twilio.com/2010-04-01/Accounts/{sid}/Calls/{call.call_id}.json"
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=3)) as http:
+            async with http.get(url, auth=aiohttp.BasicAuth(sid, token)) as response:
+                return (await response.json()).get("from") if response.status == 200 else None
+    except (aiohttp.ClientError, TimeoutError) as problem:
+        logger.warning(f"caller ID lookup failed, the bot will ask for the number instead: {problem}")
+        return None
+
+
 async def bot(runner_args: RunnerArguments):
-    """Called by the runner once per browser session."""
+    """Called by the runner once per call: a browser session, a phone call or an eval run."""
     transport = await create_transport(
         runner_args,
         {
             "webrtc": lambda: TransportParams(audio_in_enabled=True, audio_out_enabled=True),
+            # A phone call through Twilio. The runner adds the Twilio audio format itself.
+            "twilio": lambda: FastAPIWebsocketParams(audio_in_enabled=True, audio_out_enabled=True),
             # Lets Pipecat's eval harness connect as a caller (see evals/).
             "eval": lambda: EvalTransportParams(audio_in_enabled=True, audio_out_enabled=True),
         },
     )
+
+    system = SYSTEM.format(today=date.today())
+    call = getattr(runner_args, "call_data", None)  # set for phone calls only
+    number = await caller_number(call) if call else None
+    if number:
+        system += (
+            f" The caller is phoning from {number}. Use that as their phone number: do not ask them to say a "
+            "number, just check once that it is the right one to reach them on."
+        )
 
     stt = WhisperSTTService(
         device="cuda" if ctranslate2.get_cuda_device_count() else "cpu",
@@ -114,7 +148,7 @@ async def bot(runner_args: RunnerArguments):
     )
     llm = AnthropicLLMService(
         api_key=os.environ["ANTHROPIC_API_KEY"],
-        settings=AnthropicLLMService.Settings(model=MODEL, system_instruction=SYSTEM.format(today=date.today())),
+        settings=AnthropicLLMService.Settings(model=MODEL, system_instruction=system),
     )
     tts = KokoroTTSService(
         model_path=os.path.join(MODELS_DIR, "kokoro-v1.0.onnx"),
@@ -152,11 +186,20 @@ async def bot(runner_args: RunnerArguments):
         for line in breakdown.turn_contribution_lines():
             logger.info(f"    {line}")
 
-    @worker.rtvi.event_handler("on_client_ready")
-    async def on_client_ready(rtvi):
-        # A phone agent speaks first.
-        context.add_message({"role": "developer", "content": "The call has just connected. Greet the caller."})
-        await worker.queue_frames([LLMRunFrame()])
+    greeted = False
+
+    async def greet(*_):
+        # A phone agent speaks first. A browser reports "client ready" and a phone call "client connected";
+        # a browser session fires both, so greet only once.
+        nonlocal greeted
+        if not greeted:
+            greeted = True
+            context.add_message({"role": "developer", "content": "The call has just connected. Greet the caller."})
+            await worker.queue_frames([LLMRunFrame()])
+
+    worker.rtvi.event_handler("on_client_ready")(greet)
+    if call:
+        transport.event_handler("on_client_connected")(greet)
 
     @transport.event_handler("on_client_disconnected")
     async def on_client_disconnected(transport, client):

@@ -19,7 +19,7 @@ Solid boxes are built. Dashed boxes are planned.
 flowchart TB
     browser["Browser caller<br/>WebRTC"]
     sim["Simulated callers<br/>eval harness"]
-    phone["Phone caller<br/>Twilio, planned"]:::planned
+    phone["Phone caller<br/>Twilio, built, not yet live"]:::planned
 
     transport["Pipecat transport<br/>audio in and out, echo cancelled by the browser"]
 
@@ -95,6 +95,7 @@ Each phase is one or two commits, so the history reads in the same order as this
 | 2 | Streaming, GPU speech-to-text, faster model, neural voice | 2.15 s (simulated) |
 | 3 | Always-on mic, interruptions, eager end of turn | 1.5 to 1.9 s (simulated and live) |
 | 4 | Rebuilt on Pipecat with a browser client | 1.83 s on a clean live turn |
+| 4b | Phone line through Twilio | 1.9 to 3.5 s (simulated phone calls; the slower replies needed a tool call) |
 | 5 | Booking tools | Tool turns take two LLM round trips |
 | 6 | Automated voice evals | p50 3.5 s, p95 4.6 s with the harness sharing the machine |
 
@@ -205,6 +206,29 @@ two minutes of silence.
 A second idea, requiring three recognised words before the bot could be interrupted, was tried and removed. It
 made each turn wait for its transcript before starting, which added a fixed 0.8 s to every reply.
 
+### Phase 4b: the phone line
+
+```mermaid
+flowchart LR
+    phone["Caller's phone"] --> twilio["Twilio number"]
+    twilio -->|"webhook: what do I do?"| bot["bot.py"]
+    bot -->|"connect a media stream"| twilio
+    twilio <-->|"8 kHz audio over a WebSocket"| pipeline["Same pipeline"]
+    twilio -.->|"caller ID"| pipeline
+```
+
+The pipeline does not change; only the transport does. Two things are different on a phone line. The bot
+greets when the call connects, since there is no browser to say it is ready. And the caller's number arrives
+with the call, so the bot confirms it instead of asking the caller to say it, which sidesteps the
+repeated-digits problem the evals found.
+
+This is built and tested with a simulator, `evals/phone_call.py`, which speaks Twilio's media-stream protocol
+with 8 kHz phone audio. In two simulated calls the bot answered, transcribed the phone audio correctly, read
+the caller ID back, and started replying 1.9 to 3.5 s after the caller's last word; the slower replies were the
+ones that needed a tool call.
+It has not yet been tried with a real Twilio number, so looking up caller ID through Twilio's API and hanging
+up at the end of a call are untested.
+
 ### Phase 5: booking tools
 
 ```mermaid
@@ -289,6 +313,16 @@ Talk to the Pipecat bot in a browser. Open http://localhost:7860/client, click C
 .\.venv\Scripts\python bot.py
 ```
 
+Take phone calls on a Twilio number. Twilio must be able to reach the bot, so run a tunnel to it, start the
+bot with the tunnel's host name, and set that address as the number's voice webhook in the Twilio console:
+
+```powershell
+cloudflared tunnel --url http://localhost:7860
+$env:TWILIO_ACCOUNT_SID = "your-account-sid"
+$env:TWILIO_AUTH_TOKEN = "your-auth-token"
+.\.venv\Scripts\python bot.py -t twilio -x your-tunnel-host
+```
+
 Run the evals and write the report:
 
 ```powershell
@@ -304,14 +338,14 @@ $env:APPOINTMENTS_DB = "fresh"
 | `voice_loop.py` | The pipeline by hand: VAD, endpointing, speech-to-text, LLM streaming, voice, interruptions |
 | `bot.py` | The same receptionist on Pipecat, with a browser client |
 | `tools.py` | The appointment book and the tools the LLM can call |
-| `evals/` | Scripted voice scenarios, the suite manifest and the report script |
+| `evals/` | Scripted voice scenarios, the suite manifest, the report script and a Twilio call simulator |
 | `eval_services.py` | The simulated caller's voice for the eval harness |
 | `docs/` | The eval report and the editable diagrams |
 
 ## Known limits and what is next
 
-- **No phone number yet.** The plan is Twilio, which also brings caller ID and so removes the need to hear a
-  phone number at all.
+- **The phone line is not live.** The Twilio path is built and passes a simulated call, but no real number is
+  attached yet.
 - **The calendar is a local SQLite file,** not an external calendar service.
 - **Not deployed.** It runs on one machine with a local GPU.
 - **Any speech interrupts the bot,** including a short "mm-hm".
