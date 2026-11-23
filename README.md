@@ -145,8 +145,7 @@ The mic never closes, and replies are produced on a worker thread that can be ca
 
 ```mermaid
 flowchart LR
-    mic["Mic<br/>always open"] --> vad["Silero VAD"]
-    vad --> ep["Endpointer<br/>start and end events"]
+    vad["Mic, always open<br/>Silero VAD"] --> ep["Endpointer<br/>start and end events"]
     ep -->|"end: 0.4 s of quiet"| worker["Worker thread<br/>speech-to-text, LLM, voice"]
     worker --> queue["Playback queue"]
     queue --> spk["Speaker"]
@@ -228,12 +227,9 @@ as an argument because, left to say goodbye first, the model sometimes hung up i
 ```mermaid
 flowchart LR
     suite["Eval suite<br/>7 scenarios, 3 runs each"] -->|starts one per call| bot["Fresh bot.py<br/>empty appointment book"]
-    suite --> caller["Scripted caller<br/>synthesised speech"]
-    caller -->|audio| bot
+    caller["Scripted caller<br/>synthesised speech"] -->|audio| bot
     bot -->|"tool calls, speech, timings"| checks["Deterministic checks<br/>no LLM judge"]
-    checks --> results["results.jsonl"]
-    results --> report["evals/report.py"]
-    report --> md["docs/eval-report.md"]
+    checks --> report["evals/report.py<br/>writes docs/eval-report.md"]
 ```
 
 First full run: **17 of 21 calls passed.** The full report is in [docs/eval-report.md](docs/eval-report.md).
