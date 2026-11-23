@@ -2,6 +2,7 @@ anthropic
 faster-whisper
 kokoro-onnx[gpu]
 numpy
+pipecat-ai[webrtc,silero,whisper,anthropic,runner]
 sounddevice
 # GPU libraries, NVIDIA cards only (large downloads). Without them everything runs on the CPU, slowly.
 # The cu12 pair is for Whisper; the onnxruntime extras are for the Kokoro voice.
