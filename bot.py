@@ -35,7 +35,8 @@ SYSTEM = (
     "to Friday, 9 AM to 5 PM, and appointments start on the hour or the half hour. "
     "Only offer times that check_availability returned, and offer at most three at once. "
     "To book you need the caller's name, phone number, the reason for the visit and a time. Speech recognition "
-    "mishears names and numbers, so read both back and get a clear yes before you book. "
+    "mishears names and numbers, so before booking read the name, number, day and time back in one sentence "
+    "and ask once whether that is right. Book as soon as the caller says yes; do not ask a second time. "
     "If a tool reports a problem, tell the caller plainly and suggest an alternative. "
     "When the caller has nothing more to ask, call end_call with your goodbye; it says it and hangs up. "
     "Today is {today:%A} {today.day} {today:%B} {today.year}."
@@ -48,6 +49,7 @@ if GPU:
 ort.set_default_logger_severity(3)  # errors only
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.evals.transport import EvalTransportParams
 from pipecat.audio.vad.vad_analyzer import VADParams, VADState
 from pipecat.frames.frames import LLMRunFrame
 from pipecat.observers.user_bot_latency_observer import UserBotLatencyObserver
@@ -97,7 +99,12 @@ class LoudnessLoggingVAD(SileroVADAnalyzer):
 async def bot(runner_args: RunnerArguments):
     """Called by the runner once per browser session."""
     transport = await create_transport(
-        runner_args, {"webrtc": lambda: TransportParams(audio_in_enabled=True, audio_out_enabled=True)}
+        runner_args,
+        {
+            "webrtc": lambda: TransportParams(audio_in_enabled=True, audio_out_enabled=True),
+            # Lets Pipecat's eval harness connect as a caller (see evals/).
+            "eval": lambda: EvalTransportParams(audio_in_enabled=True, audio_out_enabled=True),
+        },
     )
 
     stt = WhisperSTTService(
@@ -133,7 +140,7 @@ async def bot(runner_args: RunnerArguments):
     ])
 
     latency = UserBotLatencyObserver()
-    worker = PipelineWorker(pipeline, params=PipelineParams(enable_metrics=True), observers=[latency])
+    worker = PipelineWorker(pipeline, params=PipelineParams(enable_metrics=True, enable_usage_metrics=True), observers=[latency])
     runner = WorkerRunner(handle_sigint=runner_args.handle_sigint)
 
     @latency.event_handler("on_latency_measured")

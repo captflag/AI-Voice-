@@ -1,0 +1,128 @@
+# Scripted calls to the receptionist. Every caller line is synthesised speech, so the bot's own
+# speech-to-text and turn detection are exercised for real. Checks are deterministic: which tool the
+# bot called and with what arguments, what its LLM wrote, and how quickly it started or stopped speaking.
+#
+# Dates are never pinned ("next Wednesday" resolves on the day of the run), so these hold on any day.
+
+name: receptionist
+
+user:
+  modality: audio
+  speech:
+    factory: eval_services.caller_voice
+    voice: am_michael
+
+judge:
+  modality: audio          # the bot speaks, so reply timings include voice synthesis
+  transcription:
+    service: whisper
+    model: tiny.en      # only so the bot speaks; no check reads this transcript, so keep it light
+
+scenarios:
+  # The bot speaks first and names the clinic.
+  - name: greeting
+    turns:
+      - expect:
+          - event: bot_started_speaking
+            within_ms: 20000
+          - event: llm_response
+            text_contains: "Bright Smile"
+            check_from: turn_start
+
+  # Everything given in one breath, then a yes. The booking must carry the right time, number and name,
+  # so this fails if speech-to-text mishears any of them.
+  - name: book_appointment
+    turns:
+      - expect:                     # let the greeting finish before the caller speaks
+          - event: bot_stopped_speaking
+            within_ms: 30000
+      - user: "Hi, I'd like to book a cleaning for next Wednesday at ten thirty in the morning. My name is Sam Lee, and my number is five five five, zero one four, two two three seven."
+        expect:
+          - event: bot_started_speaking
+            within_ms: 40000     # counted from when the caller starts this line
+      - user: "Yes, that's all correct. I mean the nearest Wednesday."
+        expect:
+          - event: function_call
+            calls:
+              - name: book_appointment
+                args: {time: "10:30", phone: "5550142237", name: "Sam Lee"}
+
+  # A number full of repeated digits, which speech-to-text tends to miscount.
+  - name: repeated_digits
+    turns:
+      - expect:                     # let the greeting finish before the caller speaks
+          - event: bot_stopped_speaking
+            within_ms: 30000
+      - user: "I'd like a cleaning next Tuesday at three in the afternoon. I'm Kim Park, and my number is seven four one, three three three, three three three three."
+        expect:
+          - event: bot_started_speaking
+            within_ms: 40000     # counted from when the caller starts this line
+      - user: "Yes, that's all correct. I mean the nearest Tuesday."
+        expect:
+          - event: function_call
+            calls:
+              - name: book_appointment
+                args: {time: "15:00", phone: "7413333333"}
+
+  # Book, then change the time. The move is looked up by phone number.
+  - name: reschedule
+    turns:
+      - expect:                     # let the greeting finish before the caller speaks
+          - event: bot_stopped_speaking
+            within_ms: 30000
+      - user: "Hello, I need a check-up next Thursday at nine in the morning. I'm Ana Roy, and my number is five five five, zero one zero, one two three four."
+        expect:
+          - event: bot_started_speaking
+            within_ms: 40000     # counted from when the caller starts this line
+      - user: "Yes, that's right. I mean the nearest Thursday."
+        expect:
+          - event: function_call
+            calls:
+              - name: book_appointment
+                args: {time: "09:00", phone: "5550101234"}
+      - user: "Actually, please move that appointment to two PM on the same day."
+        expect:
+          - event: function_call
+            calls:
+              - name: reschedule_appointment
+                args: {new_time: "14:00"}
+
+  # The clinic is closed at weekends, and the bot has to say so.
+  - name: weekend_refused
+    turns:
+      - expect:                     # let the greeting finish before the caller speaks
+          - event: bot_stopped_speaking
+            within_ms: 30000
+      - user: "Can I come in this Saturday at ten in the morning for a check-up?"
+        expect:
+          - event: tts_response      # what the bot said aloud; a tool call with no words is not a reply
+            text_matches: ['(?i)closed|not open|weekday|Monday (to|through) Friday']
+
+  # The caller talks over the bot 1.5 seconds into its answer. The bot must stop well before that
+  # answer would have ended on its own.
+  - name: interruption
+    turns:
+      - expect:                     # let the greeting finish before the caller speaks
+          - event: bot_stopped_speaking
+            within_ms: 30000
+      - user: "Can you tell me your opening hours, and everything I should bring to a first visit?"
+        expect:
+          - event: bot_started_speaking
+            within_ms: 40000     # counted from when the caller starts this line
+      - user: "Actually, wait a moment, I have a different question."
+        send_after: {event: bot_started_speaking, delay_ms: 1500}
+        expect:
+          - event: bot_stopped_speaking
+            within_ms: 1500
+
+  # A caller with nothing to book. The bot should say goodbye and hang up.
+  - name: wrong_number
+    turns:
+      - expect:                     # let the greeting finish before the caller speaks
+          - event: bot_stopped_speaking
+            within_ms: 30000
+      - user: "Sorry, I think I have the wrong number. Goodbye."
+        expect:
+          - event: function_call
+            calls:
+              - name: end_call

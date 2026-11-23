@@ -10,10 +10,14 @@ docstring and its arguments; the docstrings are therefore instructions to the mo
 import os
 import sqlite3
 import sys
+import tempfile
 from contextlib import closing
 from datetime import datetime, time, timedelta
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "appointments.db")
+if os.environ.get("APPOINTMENTS_DB") == "fresh":
+    # Evals set this so every bot process gets an empty book of its own and never touches the real one.
+    DB_PATH = os.path.join(tempfile.mkdtemp(prefix="appointments-"), "appointments.db")
 OPEN, CLOSE = time(9), time(17)   # Monday to Friday
 SLOT = timedelta(minutes=30)
 

@@ -1,0 +1,18 @@
+# Simulated callers for the receptionist. From the project folder:
+#
+#   $env:APPOINTMENTS_DB = "fresh"
+#   .\.venv\Scripts\python -m pipecat.evals suite evals\manifest.yaml
+#
+# The suite starts a fresh copy of bot.py for every scenario, calls it by voice, and checks what it did.
+# APPOINTMENTS_DB=fresh gives each copy an empty appointment book, so runs never collide or touch real data.
+
+concurrency: 1            # one call at a time: the bots share a single GPU
+repeat: 1
+runs_dir: runs            # logs for each run go to evals/runs/<timestamp>/
+record: false
+scenarios_dir: scenarios
+spawn: "{python} {bot} --port {port}"
+suite:
+  - bot: ../bot.py
+    name: receptionist
+    scenarios: [receptionist]
