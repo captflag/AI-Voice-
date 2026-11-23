@@ -2,20 +2,22 @@
 
     mic -> endpointing (VAD) -> speech-to-text -> LLM -> text-to-speech -> speaker
 
-Still turn-based, but the LLM reply is streamed and spoken sentence by sentence,
-so the caller hears the first sentence while the rest is being written.
-Every stage is timed.
+Still turn-based, but the LLM reply is streamed sentence by sentence, each
+sentence is synthesised as soon as it is written, and a background thread plays
+them back to back. The caller hears the first sentence while the rest is still
+being written and synthesised. Every stage is timed.
 
     python voice_loop.py           talk to it (Ctrl+C to quit)
     python voice_loop.py --check   test the pieces without a mic or an API key
 """
 import glob
 import os
+import queue
 import re
 import sys
-import tempfile
+import threading
 import time
-import wave
+import urllib.request
 from collections import deque
 from contextlib import closing
 
@@ -27,9 +29,10 @@ for _dll_dir in glob.glob(os.path.join(sys.prefix, "Lib", "site-packages", "nvid
 import anthropic
 import ctranslate2
 import numpy as np
-import pyttsx3
+import onnxruntime as ort
 import sounddevice as sd
 from faster_whisper import WhisperModel
+from kokoro_onnx import Kokoro
 
 RATE = 16000          # Hz, mono. What Whisper expects.
 FRAME = 480           # samples per frame = 30 ms
@@ -40,6 +43,9 @@ MAX_FRAMES = 1000     # 30 s cap on one utterance
 MIN_THRESHOLD = 0.01  # loudness floor for "speech". Raise it if noise triggers recordings.
 MODEL = "claude-haiku-5-5"  # measured: first sentence in ~750 ms, vs ~1,190 ms on claude-opus-5-5
 SENTENCE_END = re.compile(r"(?<=[.!?])\s+")
+VOICE = "af_sarah"    # tts.get_voices() lists the others
+MODELS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
+KOKORO_URL = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.1"
 SYSTEM = (
     "You are the receptionist at Bright Smile Dental, answering a phone call. "
     "Your words are spoken aloud, so reply in one or two short sentences of plain "
@@ -130,18 +136,42 @@ def ask(llm, history, text):
         history.append({"role": "assistant", "content": resp.content})  # whole content, not just the text
 
 
-def speak(text):
-    # ponytail: the built-in Windows voice. Robotic, but instant and offline.
-    # Phase 2 replaces it with a streaming neural voice.
-    tts = pyttsx3.init()  # keep this local: an engine held between calls goes silent after its first one
-    tts.say(text)
-    tts.runAndWait()
+def load_tts():
+    """Kokoro, a small neural voice. Measured on a GTX 1660: ~250 ms for a 3 s sentence, ~1,270 ms on CPU."""
+    paths = [os.path.join(MODELS_DIR, name) for name in ("kokoro-v1.0.onnx", "voices-v1.0.bin")]
+    for path in paths:
+        if not os.path.exists(path):  # first run only, about 350 MB in total
+            print(f"Downloading {os.path.basename(path)}...")
+            os.makedirs(MODELS_DIR, exist_ok=True)
+            urllib.request.urlretrieve(f"{KOKORO_URL}/{os.path.basename(path)}", path + ".part")
+            os.replace(path + ".part", path)  # so a half-finished download never looks complete
+    ort.set_default_logger_severity(3)  # errors only
+    available = ort.get_available_providers()
+    if "CUDAExecutionProvider" in available:
+        ort.preload_dlls()  # load the CUDA libraries pip put in the venv
+    providers = [p for p in ("CUDAExecutionProvider", "CPUExecutionProvider") if p in available]
+    tts = Kokoro.from_session(ort.InferenceSession(paths[0], providers=providers), paths[1])
+    tts.create("Warming up.", voice=VOICE)  # the first synthesis is several times slower than the rest
+    return tts
+
+
+def play_queue(speech):
+    """Play queued clips back to back, so the next sentence can be synthesised while this one plays."""
+    while True:
+        samples, rate = speech.get()
+        try:
+            sd.play(samples, rate, blocking=True)
+        except Exception as e:  # keep the thread alive, or main() would wait on the queue forever
+            print("\nplayback failed:", e)
+        finally:
+            speech.task_done()
 
 
 def main():
     llm = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY from the environment
-    stt = load_stt()
-    history = []
+    stt, tts = load_stt(), load_tts()
+    history, speech = [], queue.Queue()
+    threading.Thread(target=play_queue, args=(speech,), daemon=True).start()
 
     print("Measuring room noise, stay quiet for a second...")
     with closing(mic_frames()) as frames:
@@ -159,14 +189,19 @@ def main():
             continue
         print("you:", text)
         print("bot:", end=" ", flush=True)
-        first = None
-        for sentence in ask(llm, history, text):  # speak each sentence as soon as it is written
-            first = first or time.perf_counter()
+        t_text = t_audio = None
+        for sentence in ask(llm, history, text):
+            t_text = t_text or time.perf_counter()
             print(sentence, end=" ", flush=True)
-            speak(sentence)
-        wait, stt_ms, llm_ms = SILENCE_FRAMES * 30, (t1 - t0) * 1000, ((first or time.perf_counter()) - t1) * 1000
-        print(f"\n     [silence wait {wait} ms | stt {stt_ms:.0f} ms | llm first sentence {llm_ms:.0f} ms"
-              f" | reply starts {wait + stt_ms + llm_ms:.0f} ms after you stopped]\n")
+            speech.put(tts.create(sentence, voice=VOICE))  # playback of earlier sentences continues meanwhile
+            t_audio = t_audio or time.perf_counter()
+        speech.join()  # finish talking before listening again, or the mic hears the bot
+        if not t_audio:
+            print("(no reply)\n")
+            continue
+        wait, stt_ms, llm_ms, tts_ms = SILENCE_FRAMES * 30, (t1 - t0) * 1000, (t_text - t1) * 1000, (t_audio - t_text) * 1000
+        print(f"\n     [silence wait {wait} ms | stt {stt_ms:.0f} ms | llm first sentence {llm_ms:.0f} ms | tts {tts_ms:.0f} ms"
+              f" | reply starts {wait + stt_ms + llm_ms + tts_ms:.0f} ms after you stopped]\n")
 
 
 def check():
@@ -181,14 +216,9 @@ def check():
     assert list(sentences(["Hi the", "re. How are", " you? Bye"])) == ["Hi there.", "How are you?", "Bye"]
     print("sentence streaming ok")
 
-    # Text-to-speech into a file, then speech-to-text back out of it.
-    path = os.path.join(tempfile.gettempdir(), "voice_loop_check.wav")
-    tts = pyttsx3.init()
-    tts.save_to_file("I would like to book an appointment for Tuesday.", path)
-    tts.runAndWait()
-    with wave.open(path) as w:  # 16-bit mono at the voice's own rate; resample to 16 kHz
-        pcm = np.frombuffer(w.readframes(w.getnframes()), np.int16).astype(np.float32) / 32768
-        audio = np.interp(np.arange(0, len(pcm), w.getframerate() / RATE), np.arange(len(pcm)), pcm)
+    # The neural voice says a sentence, speech-to-text reads it back.
+    samples, rate = load_tts().create("I would like to book an appointment for Tuesday.", voice=VOICE)
+    audio = np.interp(np.arange(0, len(samples), rate / RATE), np.arange(len(samples)), samples)  # 24 kHz -> 16 kHz
     heard = transcribe(load_stt(), audio.astype(np.float32))
     assert "appointment" in heard.lower(), heard
     print("tts -> stt ok:", heard)
