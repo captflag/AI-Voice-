@@ -12,8 +12,9 @@ of the project: what a voice framework gives you, and what you still have to und
 Everything runs locally except the LLM: speech-to-text is Whisper, the voice is Kokoro, voice detection is
 Silero, retrieval embeddings are BGE-small, and the model is Claude Haiku 5.5.
 
-**Latest results:** 36 of 36 simulated voice calls passed (12 scenarios, three runs each, after the phase 8
-speech-to-text change), and 210 of 210 replies passed the grounding test (21 cases, ten runs each). Details in
+**Latest results:** 38 of 39 simulated voice calls passed (13 scenarios, three runs each; the miss was a test
+artefact, fixed and rerun 5 of 5), 250 of 250 replies passed the grounding test (25 cases, ten runs each), and
+19 of 19 checks passed in each round of the warm-transfer test on LiveKit. Details in
 [phase 7](#phase-7-clinic-knowledge-base), [phase 8](#phase-8-handing-a-call-to-a-person-in-progress) and
 [docs/eval-report.md](docs/eval-report.md).
 
@@ -41,7 +42,8 @@ flowchart TB
     end
 
     knowledge[("Clinic documents<br/>6 files, 29 sections")]
-    tools["Booking tools (tools.py)<br/>check, book, reschedule, end call"]
+    tools["Tools (tools.py)<br/>check, book, reschedule, take a message, end call"]
+    desk["Front desk (transfer.py, staff.py)<br/>warm transfer to a person"]
     db[("Appointments<br/>SQLite")]
     calendar["External calendar<br/>planned"]:::planned
     observer["Latency observer<br/>per-stage timings"]
@@ -55,6 +57,8 @@ flowchart TB
     tts -->|audio out| transport
     knowledge -->|embedded at start-up| notes
     llm <-->|tool calls| tools
+    llm -->|transfer_to_staff| desk
+    desk -.->|staff join the call| room
     tools --> db
     tools -.-> calendar
     turn -->|metrics| observer
@@ -112,7 +116,7 @@ Each phase is one or two commits, so the history reads in the same order as this
 | 5 | Booking tools | Tool turns take two LLM round trips |
 | 6 | Automated voice evals | p50 3.5 s, p95 4.6 s with the harness sharing the machine |
 | 7 | Clinic knowledge base, keypad entry for phone numbers | p50 3.5 s, p95 4.9 s in the eval run; retrieval adds 17 to 37 ms a turn |
-| 8 (in progress) | LiveKit rooms, the base for handing a call to a person | 1.6 to 2.2 s on scripted LiveKit calls |
+| 8 (in progress) | LiveKit rooms and a warm transfer to a person at the front desk | 1.6 to 2.2 s on scripted LiveKit calls |
 
 "Simulated" means synthetic caller audio fed through the real pipeline with playback muted. "Live" means a
 person talking into a microphone.
@@ -398,13 +402,15 @@ join.
 ```mermaid
 flowchart LR
     caller["Caller<br/>scripted, evals/livekit_call.py"]
-    server["LiveKit server<br/>local, dev mode"]
+    room(["Caller's room"])
     bot["Bot<br/>python bot.py -t livekit"]
-    staff["Staff member<br/>next step"]:::planned
-    caller <-->|room audio| server
-    bot <-->|room audio| server
-    staff -.->|joins on transfer| server
-    classDef planned stroke-dasharray: 5 5
+    desk(["Desk room"])
+    staff["Staff<br/>staff.py page"]
+    caller <-->|audio| room
+    bot <-->|audio| room
+    bot -->|briefing, on transfer| desk
+    staff <-->|waits for transfers| desk
+    staff -.->|joins on accept| room
 ```
 
 **Step 1, LiveKit (done).** The bot joins a room on a local LiveKit server; Pipecat's runner creates the room and
@@ -432,8 +438,76 @@ without `APPOINTMENTS_DB=fresh`: the three runs shared one appointment book, so 
 question with "I'm not sure" and then listing three correct prices nobody asked for, which the scenario counts as
 quoting a price.
 
-**Next:** the warm transfer itself, then tracing with OpenTelemetry, switchable cloud speech providers, and
-Plivo and Exotel phone lines.
+**Step 2, warm transfer (done).** A new tool, `transfer_to_staff`, takes a reason and a summary for the staff
+member. The model is told to call it when the caller asks for a person, wants to complain or dispute a bill, or
+cannot be helped, and never for something it can answer or book.
+
+```mermaid
+sequenceDiagram
+    participant C as Caller
+    participant B as Bot
+    participant S as Staff (desk room)
+    C->>B: Can I speak to a person about a charge on my bill?
+    B->>B: transfer_to_staff(reason, summary)
+    B->>C: Please hold (then hold music, a reminder every 20 s)
+    B->>S: joins the desk room, gives the briefing aloud and as text
+    S->>B: Accept
+    B->>S: a token for the caller's room
+    S->>C: joins the caller's room
+    B->>C: You're through to the front desk now. Goodbye from me.
+    B-->>C: leaves the room
+```
+
+- `transfer.py` runs the transfer. While the caller holds, a gate after speech-to-text drops their audio and
+  words, so the bot neither answers nor gets interrupted, and Pipecat's sound mixer plays a soft chime that is
+  generated at start-up, so no audio file ships with the project.
+- Staff wait in a desk room of their own, so the briefing never reaches the caller. `staff.py` serves the page
+  they keep open: it plays the briefing, shows it as text, and on Accept moves them into the caller's room
+  with the microphone on. The first to accept takes the call.
+- If nobody is at the desk, the staff decline, or nobody answers within 30 s, the music stops and the bot
+  offers to take a message: a second new tool, `take_message`, reads the name and number back and saves them
+  to a `messages` table. If the caller hangs up on hold, the desk is told.
+- Off LiveKit (the browser client, Twilio and the eval harness) there is no desk, so the tool reports that
+  nobody can be reached and the bot offers a message straight away.
+
+`evals/transfer_call.py` tests it with a scripted caller and a scripted member of staff in real rooms:
+
+| Scenario | What it checks |
+|---|---|
+| Connected | Staff get the briefing as text and speech; the caller is told to hold, then that they are through; the bot leaves; the caller hears the staff member and never hears the briefing |
+| Nobody at the desk | No hold; the bot offers to take a message |
+| Declined | The bot comes back and offers a message |
+| No answer | Hold music and a reminder play; after 30 s the desk is told the transfer was withdrawn and the bot offers a message |
+| Caller hangs up | The desk is told the caller hung up |
+
+All 19 checks passed in each of three rounds, fifteen calls, the first two back to back on one bot. The staff
+page was also tried in a browser: the briefing card appeared, Accept moved it into the caller's room, and the
+caller heard "You're through to the front desk now" before the bot left. The test browser has no microphone,
+so the page said so instead of going quiet; talking to the caller from the page has not been tried.
+
+#### What testing the transfer found
+
+| Problem | Fix |
+|---|---|
+| The caller's request arrived in two pieces. The second was mid-transcription when the hold began, reached the model as a new turn, and the bot started a second transfer and talked over the hold | The gate moved after speech-to-text and drops words as well as audio; a repeated transfer request does nothing |
+| By the sixth call on one bot the GPU was full (5.8 of 6 GB), the voice took 4 to 29 s to start and some lines came out silent. Pipecat loads a fresh voice and speech model for every call; the eval harness starts a new process per call, so it never showed | Each model is loaded once per process and shared. Over ten more calls the GPU stayed at 2.2 to 2.4 GB and the voice started in 0.1 to 1.0 s |
+| The browser page never showed the first briefing. The bot sent it as a data message the moment it joined the desk, while the browser was still setting up the connection it receives on; the scripted staff were simply quicker | The briefing travels in the bot's join token as a participant attribute, which arrives with the bot itself. The page also listens for attributes that arrive after the participant does |
+| Reading a keypad number back as "ending in 3333333" (2 of 10 replies, then 1 of 20) | The prompt says to read the whole number |
+| "The facts say to treat facial swelling..." (1 of 250 replies) | The prompt names "the facts" among the words never to say; 0 of 120 since on the cases most prone to it |
+
+Test flaws fixed along the way: the grounding check flagged "a brief note about the charge" as mentioning the
+notes and did not recognise a number read digit by digit; the new voice scenario's caller said "yes" before the
+bot had read the number back; and the medical-advice caller's line was still split by speech-to-text at its
+comma, so the harness scored a cut-off empty reply (now one clause with no pause, 5 of 5).
+
+The grounding test has four new cases (asking for a person, a billing dispute, reading a message back, saving
+it once confirmed) and a new check that no reply claims a message it did not save: **250 of 250** on the final
+prompt, and 160 of 160 when the four new cases ran 40 times each. The voice suite has a new scenario in which
+nobody can take the call and the message is saved with the right name and number: the full suite scored
+**38 of 39**, the miss being the medical-advice artefact above, with replies at p50 2.7 s and p95 3.8 s
+([docs/eval-report.md](docs/eval-report.md)).
+
+**Next:** tracing with OpenTelemetry, switchable cloud speech providers, and Plivo and Exotel phone lines.
 
 ## Run it
 
@@ -496,6 +570,15 @@ $env:LIVEKIT_URL = "ws://127.0.0.1:7880"; $env:LIVEKIT_API_KEY = "devkey"; $env:
 .\.venv\Scripts\python evals\livekit_call.py
 ```
 
+Try a transfer. Start the staff page with the same three `LIVEKIT_` variables set, open http://localhost:7870 and
+press Start shift; then either ask the bot for a person from your own LiveKit client, or run the scripted
+transfer test (close the staff page first, since it counts as someone at the desk):
+
+```powershell
+.\.venv\Scripts\python staff.py
+.\.venv\Scripts\python evals\transfer_call.py
+```
+
 Run the evals and write the report. The grounding test calls Claude directly and takes a few minutes; the voice
 suite starts a fresh bot for every call and takes about 17 minutes:
 
@@ -512,10 +595,12 @@ $env:APPOINTMENTS_DB = "fresh"
 |---|---|
 | `voice_loop.py` | The pipeline by hand: VAD, endpointing, speech-to-text, LLM streaming, voice, interruptions |
 | `bot.py` | The same receptionist on Pipecat: browser, LiveKit, Twilio and eval transports |
-| `tools.py` | The appointment book and the tools the LLM can call |
+| `tools.py` | The appointment book, messages, and the tools the LLM can call |
+| `transfer.py` | The warm transfer: hold, the private briefing, the handover and the fallback to a message |
+| `staff.py`, `staff.html` | The front desk page staff keep open to take transfers |
 | `rag.py` | Retrieval: chunking, embeddings, the booking check, and attaching facts to a caller's turn |
 | `knowledge/` | The clinic's documents |
-| `evals/` | Voice scenarios and manifest, the grounding test, labelled retrieval questions, a test of the facts processor, the report script, a Twilio call simulator, a scripted LiveKit caller and a check of how Whisper hears the clinic's names |
+| `evals/` | Voice scenarios and manifest, the grounding test, labelled retrieval questions, a test of the facts processor, the report script, a Twilio call simulator, a scripted LiveKit caller, the transfer test and a check of how Whisper hears the clinic's names |
 | `eval_services.py` | The simulated caller's voice for the eval harness |
 | `docs/` | The eval report and the editable diagrams |
 
@@ -538,3 +623,8 @@ $env:APPOINTMENTS_DB = "fresh"
 - **LiveKit is tested with a scripted caller on a local server,** not yet with a person on a microphone or a
   hosted LiveKit server.
 - **Aetna is still misheard** in one voice of three, even with hotwords.
+- **Transfers need LiveKit.** On the browser client and the Twilio line the bot can only take a message.
+- **A caller on hold cannot change their mind:** their words are dropped until staff answer or the bot comes
+  back, so "never mind" is not heard.
+- **One desk, first to accept wins.** There is no queue order, no skills routing and no transfer to a staff
+  member's phone, which would need LiveKit's SIP service.

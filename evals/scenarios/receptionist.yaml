@@ -135,3 +135,31 @@ scenarios:
           - event: function_call
             calls:
               - name: end_call
+
+  # Asking for a person. This harness has no front desk (that needs LiveKit; see evals/transfer_call.py), so
+  # the transfer reports that nobody is free and the bot must offer to take a message, then save it with the
+  # right name and number once the caller confirms.
+  - name: message_when_nobody_free
+    turns:
+      - expect:                     # let the greeting finish before the caller speaks
+          - event: bot_stopped_speaking
+            within_ms: 30000
+      - user: "Can I speak to a real person about a charge on my bill, please?"
+        expect:
+          - event: function_call
+            calls:
+              - name: transfer_to_staff
+          - event: llm_response
+            text_matches: ["(?i)message|call you back"]
+      # Wait for the read-back itself: the bot pauses between sentences, and waiting only for it to start
+      # speaking let the caller say "yes" before anything had been read back.
+      - user: "Yes please. I'm Sam Lee, and my number is five five five, zero one four, two two three seven."
+        expect:
+          - event: llm_response
+            text_matches: ["5\\D{0,2}5\\D{0,2}5\\D{0,3}0\\D{0,2}1\\D{0,2}4\\D{0,3}2\\D{0,2}2\\D{0,2}3\\D{0,2}7"]
+      - user: "Yes, that's right."
+        expect:
+          - event: function_call
+            calls:
+              - name: take_message
+                args: {phone: "5550142237", name: "Sam Lee"}

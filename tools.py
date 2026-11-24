@@ -31,7 +31,15 @@ def connect(path=DB_PATH):
     # start is the primary key: one chair, so the database itself refuses a double booking.
     db.execute("CREATE TABLE IF NOT EXISTS appointments "
                "(start TEXT PRIMARY KEY, name TEXT NOT NULL, phone TEXT NOT NULL, service TEXT NOT NULL)")
+    db.execute("CREATE TABLE IF NOT EXISTS messages (taken TEXT NOT NULL, name TEXT NOT NULL, phone TEXT NOT NULL, "
+               "message TEXT NOT NULL)")
     return db
+
+
+def leave_message(db, name, phone, message, now):
+    """A message for the staff to call the caller back."""
+    with db:
+        db.execute("INSERT INTO messages VALUES (?, ?, ?, ?)", (now.isoformat(), name.strip(), digits(phone), message.strip()))
 
 
 def say(when):
@@ -183,7 +191,42 @@ async def end_call(params, farewell: str):
     await params.llm.push_frame(EndWorkerFrame())  # queued behind the goodbye, so the call ends after it plays
 
 
-TOOLS = [check_availability, book_appointment, reschedule_appointment, end_call]
+async def transfer_to_staff(params, reason: str, summary: str):
+    """Put the caller on hold and hand the call to a member of staff. Call it, saying nothing first, when the
+    caller asks for a person, wants to complain or dispute a bill, or you have tried and cannot help. It tells
+    the caller to hold. Never call it for something you can answer or book yourself.
+
+    Args:
+        reason: Why the caller needs a person, in a few words, such as "billing dispute".
+        summary: One or two sentences for the staff member: the caller's name and number if known, what they
+            want, and what you have already done.
+    """
+    desk = getattr(params.llm, "desk", None)  # set by bot.py on LiveKit calls; other lines have no desk
+    problem = await desk.begin(reason, summary) if desk else (
+        "Nobody from the staff can be reached on this line. Offer to take a message so someone can call back.")
+    if problem:
+        await params.result_callback({"error": problem})
+    else:
+        await params.result_callback({"on_hold": True}, properties=FunctionCallResultProperties(run_llm=False))
+
+
+async def take_message(params, name: str, phone: str, message: str):
+    """Leave a message for the staff to call the caller back. Read the name and number back first.
+
+    Args:
+        name: The caller's full name.
+        phone: The caller's 10-digit phone number, digits only.
+        message: What the call back is about, in one sentence.
+    """
+    try:
+        with closing(connect()) as db:
+            leave_message(db, name, phone, message, datetime.now())
+        await params.result_callback({"message_taken": True, "callback_to": name})
+    except Refused as problem:
+        await params.result_callback({"error": str(problem)})
+
+
+TOOLS = [check_availability, book_appointment, reschedule_appointment, transfer_to_staff, take_message, end_call]
 
 
 def check():
@@ -216,6 +259,8 @@ def check():
             except Refused:
                 pass
         assert say(new) == "Tuesday 24 November at 2:00 PM", say(new)
+        leave_message(db, "Kim Park", "(741) 333-3333", "Wants to dispute a bill", now)
+        assert db.execute("SELECT name, phone FROM messages").fetchall() == [("Kim Park", "7413333333")]
     print("appointment book ok")
 
 

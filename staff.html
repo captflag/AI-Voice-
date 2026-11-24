@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Front desk</title>
+<style>
+  :root { --bg: #f6f7f9; --card: #fff; --text: #1b1f24; --muted: #5b6573; --accent: #2563eb; --line: #d5dae1; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #14171c; --card: #1d2128; --text: #e8ebef; --muted: #9aa4b2; --accent: #6b9cff; --line: #2e343d; }
+  }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 16px/1.5 system-ui, sans-serif; }
+  main { max-width: 560px; margin: 40px auto; padding: 0 16px; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  .status { color: var(--muted); margin-bottom: 20px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 18px; margin-bottom: 16px; }
+  input { font: inherit; padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--text); }
+  button { font: inherit; padding: 8px 16px; border-radius: 6px; border: 1px solid var(--line); background: var(--card); color: var(--text); cursor: pointer; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Bright Smile Dental: front desk</h1>
+  <div class="status" id="status">Not at the desk.</div>
+
+  <div class="card" id="signin">
+    <label for="name">Your name</label>
+    <div class="row" style="margin-top:6px">
+      <input id="name" value="Sam" autocomplete="name">
+      <button class="primary" id="start">Start shift</button>
+    </div>
+  </div>
+
+  <div class="card" id="transfer" hidden>
+    <strong>Incoming transfer</strong>
+    <p id="brief"></p>
+    <div class="row">
+      <button class="primary" id="accept">Accept</button>
+      <button id="decline">Decline</button>
+    </div>
+  </div>
+
+  <div class="card" id="oncall" hidden>
+    <strong>On a call with the caller</strong>
+    <p>Your microphone is on.</p>
+    <button id="hangup">Hang up and return to the desk</button>
+  </div>
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/livekit-client@2.22.4/dist/livekit-client.umd.js"></script>
+<script>
+  const { Room, RoomEvent } = LivekitClient;
+  const $ = (id) => document.getElementById(id);
+  let room = null;
+
+  function status(text) { $("status").textContent = text; }
+
+  async function connect(url, token, microphone) {
+    if (room) await room.disconnect();
+    room = new Room();
+    room.on(RoomEvent.TrackSubscribed, (track) => {
+      if (track.kind === "audio") document.body.appendChild(track.attach());
+    });
+    room.on(RoomEvent.DataReceived, (payload) => handle(JSON.parse(new TextDecoder().decode(payload))));
+    // The bot's briefing is an attribute it joins the desk with, so it is there as soon as the bot appears. The
+    // client reports a new participant before their attributes, so both events are watched.
+    const briefing = (p) => p.attributes.brief && handle({ type: "brief", text: p.attributes.brief });
+    room.on(RoomEvent.ParticipantConnected, briefing);
+    room.on(RoomEvent.ParticipantAttributesChanged, (changed, p) => briefing(p));
+    await room.connect(url, token);
+    room.remoteParticipants.forEach(briefing);
+    await room.startAudio();
+    if (microphone) await room.localParticipant.setMicrophoneEnabled(true);
+  }
+
+  async function joinDesk() {
+    const name = encodeURIComponent($("name").value);
+    const { url, token } = await (await fetch(`/token?name=${name}`)).json();
+    await connect(url, token, false);
+    $("signin").hidden = true; $("oncall").hidden = true; $("transfer").hidden = true;
+    status("At the desk, waiting for transfers.");
+  }
+
+  async function answer(choice) {
+    $("transfer").hidden = true;
+    await room.localParticipant.publishData(new TextEncoder().encode(JSON.stringify({ type: choice })), { reliable: true });
+    status(choice === "accept" ? "Connecting you to the caller..." : "Declined. Waiting for transfers.");
+  }
+
+  async function handle(message) {
+    if (message.type === "brief") {
+      $("brief").textContent = message.text;
+      $("transfer").hidden = false;
+      status("A caller is on hold.");
+    } else if (message.type === "join") {
+      $("oncall").hidden = false;
+      try {
+        await connect(message.url, message.token, true);
+        status("On a call.");
+      } catch (e) {
+        status(`On a call, but the microphone could not start: ${e.message}`);
+      }
+    } else if (message.type === "withdrawn") {
+      $("transfer").hidden = true;
+      status(`Transfer withdrawn: ${message.text || "it was not answered in time"}. Waiting for transfers.`);
+    }
+  }
+
+  $("start").onclick = () => joinDesk().catch((e) => status(`Could not join the desk: ${e.message}`));
+  $("accept").onclick = () => answer("accept");
+  $("decline").onclick = () => answer("decline");
+  $("hangup").onclick = () => joinDesk();
+</script>
+</body>
+</html>

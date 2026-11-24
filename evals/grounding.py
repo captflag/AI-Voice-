@@ -32,12 +32,16 @@ from voice_loop import MODEL
 
 RUNS = next((int(a) for a in sys.argv[1:] if a.isdigit()), 3)
 VERBOSE = "-v" in sys.argv
+ONLY = [a for a in sys.argv[1:] if not a.isdigit() and a != "-v"]  # run only cases whose name contains one of these
 GREETING = "Hello, thank you for calling Bright Smile Dental. How can I help you today?"
 # Every reply: the caller must never hear about the notes. An earlier run said "The clinic notes say...".
-NEVER = r"\bnotes?\b|\bdocuments?\b|clinic_facts|<|\bthe facts (I have|provided|given|say)"
+# "Take a brief note about the charge" is fine; "the notes" and "the clinic notes" are not.
+NEVER = r"\bnotes\b|\b(the|clinic|my|our) note\b|\bdocuments?\b|clinic_facts|<|\bthe facts (I have|provided|given|say)"
 # Every reply: no claim that something was booked or moved unless a tool did it in that reply. A voice eval
 # caught "Sorry about that, I booked the wrong day" when only a time had been checked.
 BOOKED_CLAIM = r"\bI(.ve| have)? (booked|moved|rescheduled)|\b(is|are|you.re|you are|it.s|that.s) (now )?(booked|moved|rescheduled)\b|booked (you|it|that|the wrong)"
+# Every reply: no claim that a message was taken unless take_message saved it in that reply.
+MESSAGE_CLAIM = r"\bI.ve (taken|noted|passed on|left) (your|the|a) message|message (is|has been) (taken|saved|passed on)"
 DONT_KNOW = r"don.t have|do not have|not sure|don.t know|do not know|no information|can.t confirm|cannot confirm|unable to|not able to|someone (to )?call you back|call you back"
 
 # (name, what the caller says in fragments, regex the reply must match, regex it must not match).
@@ -87,6 +91,21 @@ CASES = [
      [("user", "I'd like a cleaning tomorrow at ten. I'm Kim Park and my number is 741-333-333."),
       ("assistant", "Tomorrow at 10 AM is free for a cleaning, Kim. I may have missed a digit of your number: could "
                     "you type it on your phone keypad and press the pound key?")]),
+    # Handing over to a person. Off LiveKit there is no desk, so the tool reports that nobody can be reached
+    # and the bot should offer a message instead; every other case fails if it transfers at all.
+    ("transfer: asks for a person", ["Can I speak to a real person, please?"],
+     r"(?=.*\[transfer_to_staff)(?=.*(message|call you back))", None),
+    ("transfer: billing dispute", ["I was charged twice for my last cleaning and I want it sorted out."],
+     r"(?=.*\[transfer_to_staff)(?=.*(message|call you back))", None),
+    ("message: read back before saving", ["Sure, it's Kim Park, 741 333 3333, about a double charge."],
+     r"741\D{0,2}333\D{0,2}3333", r"\[take_message",
+     [("user", "Can I speak to someone about my bill?"),
+      ("assistant", "I'm sorry, nobody is at the front desk right now. Can I take a message so someone can call you back?")]),
+    ("message: saved once confirmed", ["Yes, that's right."], r"\[take_message", None,
+     [("user", "Can I speak to someone about my bill?"),
+      ("assistant", "I'm sorry, nobody is at the front desk right now. Can I take a message so someone can call you back?"),
+      ("user", "Sure, it's Kim Park, 741 333 3333, about a double charge."),
+      ("assistant", "Thanks, Kim. That's Kim Park on 741 333 3333, about a double charge. Is that right?")]),
 ]
 
 
@@ -158,7 +177,8 @@ async def run_case(client, gate, system, case):
         problem = None
         if text is None:
             problem, text = "model refused", ""
-        elif not re.search(must, text + " " + " ".join(called), re.I | re.S):
+        # A number read digit by digit ("7 4 1, 3 3 3, ...") is joined up before matching.
+        elif not re.search(must, re.sub(r"(?<=\d)[ ,.-]+(?=\d)", "", text) + " " + " ".join(called), re.I | re.S):
             problem = "missing what it should say"
         elif must_not and re.search(must_not, text, re.I | re.S):
             problem = "said what it must not"
@@ -166,6 +186,13 @@ async def run_case(client, gate, system, case):
             problem = "mentioned the notes to the caller"
         elif not booked and re.search(BOOKED_CLAIM, text, re.I):
             problem = "claimed a booking that did not happen"
+        elif not any('"message_taken": true' in c for c in called) and re.search(MESSAGE_CLAIM, text, re.I):
+            problem = "claimed a message it did not save"
+        # The message cases began with the caller asking for a person, but their history has no transfer in
+        # it, so trying the desk once more before taking the message is reasonable there.
+        elif ("transfer_to_staff" not in must and not name.startswith("message")
+              and any("[transfer_to_staff" in c for c in called)):
+            problem = "handed over a call it could handle"
         results.append((problem, text + ("  " + " ".join(called) if called else "")))
     return name, sections, results
 
@@ -174,7 +201,8 @@ async def main():
     client = anthropic.AsyncAnthropic()
     gate = asyncio.Semaphore(6)
     system = SYSTEM.format(today=date.today())
-    outcomes = await asyncio.gather(*(run_case(client, gate, system, case) for case in CASES))
+    cases = [c for c in CASES if not ONLY or any(word in c[0] for word in ONLY)]
+    outcomes = await asyncio.gather(*(run_case(client, gate, system, case) for case in cases))
     passed = total = 0
     for name, sections, results in outcomes:
         ok = sum(problem is None for problem, _ in results)
@@ -182,8 +210,8 @@ async def main():
         print(f"{'PASS' if ok == len(results) else 'FAIL'} {ok}/{len(results)}  {name:34s} notes: {', '.join(sections) or 'none'}")
         for problem, text in results:
             if problem or VERBOSE:
-                print(f"       {problem or 'reply'}: {text[:300]!r}")
-    print(f"\n{passed}/{total} replies passed across {len(CASES)} cases")
+                print(f"       {problem or 'reply'}: {text[:700]!r}")
+    print(f"\n{passed}/{total} replies passed across {len(cases)} cases")
 
 
 asyncio.run(main())

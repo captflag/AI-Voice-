@@ -16,6 +16,7 @@ supplies what that file had to implement:
 Phase 5 adds tools (tools.py): the receptionist can check free times, book and reschedule
 appointments, and hang up when the caller is done.
 """
+import functools
 import os
 from datetime import date
 
@@ -39,7 +40,8 @@ SYSTEM = (
     "to Friday, 9 AM to 5 PM, and appointments start on the hour or the half hour. "
     "Only offer times that check_availability returned, and offer at most three at once. "
     "To book you need the caller's name, phone number, the reason for the visit and a time. Speech recognition "
-    "mishears names and numbers, so before booking read the name, number, day and time back in one sentence "
+    "mishears names and numbers, so before booking read the name, the whole number (never just its last "
+    "digits), day and time back in one sentence "
     "and ask once whether that is right. Book as soon as the caller says yes; do not ask a second time. "
     "Phone numbers here have 10 digits. If the number you heard does not have exactly 10, do not read it back: "
     "ask the caller to type it on their phone keypad and press the pound key. Keypad entries reach you as "
@@ -49,14 +51,18 @@ SYSTEM = (
     "If a tool reports a problem, tell the caller plainly and suggest an alternative. "
     "Callers also ask about prices, insurance, opening hours, parking, first visits, cancellations and "
     "emergencies. Facts about the clinic arrive inside <clinic_facts> tags after the caller's words. They are "
-    "your own knowledge as the receptionist: answer from them, and never mention the tags, notes, documents or "
-    "where a fact came from. The facts only cover the topics they mention: a list of what the clinic offers or "
+    "your own knowledge as the receptionist: answer from them, and never mention the tags, \"the facts\", notes, "
+    "documents or where a fact came from. The facts only cover the topics they mention: a list of what the clinic offers or "
     "accepts settles questions about that kind of thing only, and anything the facts do not mention is unknown, "
     "not a no. When the facts do not cover a question, do not say whether the clinic does or does not do it, and "
     "do not explain why you cannot answer: say \"I'm not sure about that\" and offer to have someone call back. "
     "Never guess a price or a policy. "
     "Never give medical advice or say which symptoms matter: for pain or swelling, offer an emergency "
     "appointment, and repeat only the emergency guidance the facts give. "
+    "If the caller asks to speak to a person, wants to complain or dispute a bill, or you have tried and still "
+    "cannot help, call transfer_to_staff without saying anything first; it tells the caller to hold. If nobody "
+    "can take the call, offer to take a message: get the caller's name, number and what it is about, read the "
+    "name and number back, and call take_message once they agree. "
     "When the caller has nothing more to ask, call end_call with your goodbye; it says it and hangs up. "
     "Today is {today:%A} {today.day} {today:%B} {today.year}."
 )
@@ -81,10 +87,21 @@ from pipecat.processors.aggregators.llm_response_universal import LLMContextAggr
 from pipecat.runner.types import LiveKitRunnerArguments, RunnerArguments
 from pipecat.runner.utils import create_transport
 from pipecat.services.anthropic.llm import AnthropicLLMService
+import pipecat.services.kokoro.tts as kokoro_tts
+import pipecat.services.whisper.stt as whisper_stt
 from pipecat.services.kokoro.tts import KokoroTTSService
 from pipecat.services.whisper.stt import WhisperSTTService
+
+# One copy of each local model per process, shared by every call. Pipecat loads fresh copies for each call, and
+# on the LiveKit runner, where one process takes every call, six calls filled the 6 GB GPU and the voice took
+# up to 29 s to start. (The eval harness starts a new process per call, so it never showed.)
+kokoro_tts.Kokoro = functools.cache(kokoro_tts.Kokoro)
+whisper_stt.WhisperModel = functools.cache(whisper_stt.WhisperModel)
 from pipecat.transports.base_transport import TransportParams
 from pipecat.transports.livekit.transport import LiveKitParams
+from pipecat.audio.mixers.soundfile_mixer import SoundfileMixer
+
+import transfer
 from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams
 from pipecat.workers.runner import WorkerRunner
 
@@ -172,7 +189,11 @@ async def bot(runner_args: RunnerArguments):
         {
             "webrtc": lambda: TransportParams(audio_in_enabled=True, audio_out_enabled=True),
             # A LiveKit room: the base for adding a second person (a staff member) to the call.
-            "livekit": lambda: LiveKitParams(audio_in_enabled=True, audio_out_enabled=True),
+            "livekit": lambda: LiveKitParams(
+                audio_in_enabled=True, audio_out_enabled=True, audio_out_sample_rate=transfer.RATE,
+                # Hold music for transfers, silent until a transfer turns it on.
+                audio_out_mixer=SoundfileMixer(sound_files={"hold": transfer.hold_music()}, default_sound="hold",
+                                               volume=0.3, mixing=False)),
             # A phone call through Twilio. The runner adds the Twilio audio format itself.
             "twilio": lambda: FastAPIWebsocketParams(audio_in_enabled=True, audio_out_enabled=True),
             # Lets Pipecat's eval harness connect as a caller (see evals/).
@@ -212,9 +233,11 @@ async def bot(runner_args: RunnerArguments):
         user_params=LLMUserAggregatorParams(vad_analyzer=LoudnessLoggingVAD(params=VADParams(min_volume=MIN_VOLUME))),
     )
 
+    gate = transfer.HoldGate()
     pipeline = Pipeline([
         transport.input(),     # caller audio in
         stt,
+        gate,                  # drops the caller's audio and words while they are on hold for a transfer
         DTMFAggregator(),      # keypad presses become a "DTMF: 7413333333#" transcription
         user_aggregator,       # decides when the caller's turn is over
         ClinicNotes(),         # attaches matching clinic notes to the caller's turn
@@ -252,8 +275,21 @@ async def bot(runner_args: RunnerArguments):
     if call or isinstance(runner_args, LiveKitRunnerArguments):  # these callers may not send "client ready"
         transport.event_handler("on_client_connected")(greet)
 
+    desk = None
+    if isinstance(runner_args, LiveKitRunnerArguments):  # only a LiveKit room can take a second person
+        desk = transfer.Desk(runner_args.url, runner_args.room_name, gate, worker, context, tts._kokoro, VOICE)
+        llm.desk = desk  # transfer_to_staff in tools.py finds it here
+
+        @transport.event_handler("on_participant_connected")
+        async def on_participant_connected(transport, identity):
+            desk.staff_joined(identity)
+
     @transport.event_handler("on_client_disconnected")
     async def on_client_disconnected(transport, client):
+        if desk and desk.outcome == "connected":
+            return  # the bot is handing over and leaving; the call goes on without it
+        if desk:
+            await desk.cancel("The caller hung up.")
         await runner.cancel()
 
     await runner.add_workers(worker)
