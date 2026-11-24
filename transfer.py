@@ -11,7 +11,8 @@ Staff wait in a LiveKit room of their own, the desk (staff.py serves the page th
     4. fallback  nobody at the desk, a decline, or no answer in 30 s: the music stops and the bot is told to
                  offer to take a message instead
 
-The tool the model calls is transfer_to_staff in tools.py; it finds this object as params.llm.desk.
+The tool the model calls is transfer_to_staff in tools.py; it finds this object as params.llm.desk. Each transfer
+is a "transfer" span (telemetry.py) from the briefing to its outcome, so its length is how long the caller held.
 """
 import asyncio
 import json
@@ -24,10 +25,13 @@ from livekit import api, rtc
 from loguru import logger
 from pipecat.frames.frames import (EndWorkerFrame, Frame, InputAudioRawFrame, InterimTranscriptionFrame,
                                    LLMRunFrame, MixerEnableFrame, TranscriptionFrame, TTSSpeakFrame)
+from opentelemetry.trace import StatusCode
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
+from telemetry import tracer
+
 DESK = "front-desk"
-ANSWER_WITHIN = 30     # seconds from the start of the briefing
+ANSWER_WITHIN = 30     # seconds after the spoken briefing ends (staff can accept while it plays)
 REMIND_EVERY = 20      # seconds between "thanks for holding" lines
 RATE = 24000           # the bot's output rate, which the hold music must match
 BOT_ID = "receptionist"
@@ -98,9 +102,14 @@ class Desk:
         await self.room.connect(self.url, token(DESK, f"{BOT_ID}-{self.caller_room}", "Receptionist",
                                                 {"brief": brief}))
         staff = [p.identity for p in self.room.remote_participants.values() if not p.identity.startswith(BOT_ID)]
+        # A child of the transfer_to_staff tool span, but it runs on until the transfer ends. The summary is left
+        # out of it: it holds the caller's name and number.
+        self.span = tracer.start_span("transfer", attributes={"transfer.reason": reason,
+                                                              "transfer.staff_at_desk": len(staff)})
         if not staff:
             await self.room.disconnect()
             self.room, self.outcome = None, "no staff"
+            self._finish()
             logger.info("transfer: nobody at the desk")
             return "Nobody is at the front desk right now. Offer to take a message so someone can call back."
         logger.info(f"transfer: {len(staff)} at the desk, briefing them: {reason}")
@@ -122,12 +131,15 @@ class Desk:
         reminders = asyncio.create_task(self._remind())
         try:
             await self._say(brief + " Press accept to take the call.")
+            self.span.add_event("staff briefed")
             choice, who = await asyncio.wait_for(answered, ANSWER_WITHIN)
+            self.span.add_event(choice, {"staff": who})
             if choice == "decline":
                 return await self._fall_back("declined", "The front desk could not take the call.")
             self.staff = who
             await self._send({"type": "join", "url": self.url, "token": token(self.caller_room, who)}, who)
             await asyncio.wait_for(self.joined.wait(), 15)
+            self.span.add_event("staff joined the caller")
             reminders.cancel()
             self.outcome = "connected"
             logger.info(f"transfer: {who} joined the caller, the bot leaves")
@@ -141,6 +153,13 @@ class Desk:
         finally:
             reminders.cancel()
             await self._leave_desk()
+            self._finish()
+
+    def _finish(self):
+        self.span.set_attribute("transfer.outcome", self.outcome or "error")
+        if not self.outcome:
+            self.span.set_status(StatusCode.ERROR)
+        self.span.end()
 
     def staff_joined(self, identity):
         """Called when anyone joins the caller's room; the bot leaves once it is the member of staff."""

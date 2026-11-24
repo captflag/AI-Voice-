@@ -14,7 +14,8 @@ supplies what that file had to implement:
     the timing line         -> UserBotLatencyObserver
 
 Phase 5 adds tools (tools.py): the receptionist can check free times, book and reschedule
-appointments, and hang up when the caller is done.
+appointments, and hang up when the caller is done. Phase 8 adds LiveKit, transfers to the front desk
+(transfer.py) and OpenTelemetry traces (telemetry.py).
 """
 import functools
 import os
@@ -24,13 +25,16 @@ import aiohttp
 import ctranslate2
 import onnxruntime as ort
 from loguru import logger
+from opentelemetry import context as otel_context
 
 # Importing voice_loop also puts the NVIDIA DLLs on PATH, which Whisper needs here too.
 import rag
+import telemetry
 from tools import TOOLS
 from voice_loop import MODEL, MODELS_DIR, VOICE
 
 KNOWLEDGE = rag.Index()  # the clinic's documents, embedded once when the server starts
+TRACING = telemetry.setup()  # OpenTelemetry, when OTEL_EXPORTER_OTLP_ENDPOINT is set
 
 SYSTEM = (
     "You are the receptionist at Bright Smile Dental, answering a phone call. Your words are spoken aloud, so "
@@ -184,6 +188,9 @@ async def caller_number(call):
 
 async def bot(runner_args: RunnerArguments):
     """Called by the runner once per call: a browser session, a phone call or an eval run."""
+    # FastAPI traces the runner's /start request, and this call would become a child of that 1 ms span. Each
+    # call gets a trace of its own instead, with its conversation span as the root.
+    otel_context.attach(otel_context.Context())
     transport = await create_transport(
         runner_args,
         {
@@ -227,7 +234,8 @@ async def bot(runner_args: RunnerArguments):
     )
 
     # The conversation history, and the two processors that write the caller's and the bot's turns into it.
-    context = LLMContext(tools=TOOLS)  # Pipecat reads each tool's signature and docstring and registers it
+    # Pipecat reads each tool's signature and docstring and registers it; each call is also a span.
+    context = LLMContext(tools=[telemetry.traced(tool) for tool in TOOLS])
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
         context,
         user_params=LLMUserAggregatorParams(vad_analyzer=LoudnessLoggingVAD(params=VADParams(min_volume=MIN_VOLUME))),
@@ -248,7 +256,9 @@ async def bot(runner_args: RunnerArguments):
     ])
 
     latency = UserBotLatencyObserver()
-    worker = PipelineWorker(pipeline, params=PipelineParams(enable_metrics=True, enable_usage_metrics=True), observers=[latency])
+    worker = PipelineWorker(pipeline, params=PipelineParams(enable_metrics=True, enable_usage_metrics=True),
+                            observers=[latency], enable_tracing=TRACING,
+                            conversation_id=getattr(runner_args, "room_name", None))  # LiveKit: the room's name
     runner = WorkerRunner(handle_sigint=runner_args.handle_sigint)
 
     @latency.event_handler("on_latency_measured")

@@ -47,6 +47,7 @@ flowchart TB
     db[("Appointments<br/>SQLite")]
     calendar["External calendar<br/>planned"]:::planned
     observer["Latency observer<br/>per-stage timings"]
+    traces["Traces (telemetry.py)<br/>OpenTelemetry to Jaeger or SigNoz"]
     report["Eval report<br/>pass rate, p50/p95, cost"]
 
     browser -->|WebRTC| transport
@@ -62,6 +63,8 @@ flowchart TB
     tools --> db
     tools -.-> calendar
     turn -->|metrics| observer
+    pipeline -->|a span per call, turn, service and tool| traces
+    desk -->|transfer span| traces
     sim --> report
 
     classDef planned stroke-dasharray: 5 5
@@ -116,7 +119,7 @@ Each phase is one or two commits, so the history reads in the same order as this
 | 5 | Booking tools | Tool turns take two LLM round trips |
 | 6 | Automated voice evals | p50 3.5 s, p95 4.6 s with the harness sharing the machine |
 | 7 | Clinic knowledge base, keypad entry for phone numbers | p50 3.5 s, p95 4.9 s in the eval run; retrieval adds 17 to 37 ms a turn |
-| 8 (in progress) | LiveKit rooms and a warm transfer to a person at the front desk | 1.6 to 2.2 s on scripted LiveKit calls |
+| 8 (in progress) | LiveKit rooms, a warm transfer to a person at the front desk, OpenTelemetry traces | 1.6 to 2.2 s on scripted LiveKit calls |
 
 "Simulated" means synthetic caller audio fed through the real pipeline with playback muted. "Live" means a
 person talking into a microphone.
@@ -507,7 +510,38 @@ nobody can take the call and the message is saved with the right name and number
 **38 of 39**, the miss being the medical-advice artefact above, with replies at p50 2.7 s and p95 3.8 s
 ([docs/eval-report.md](docs/eval-report.md)).
 
-**Next:** tracing with OpenTelemetry, switchable cloud speech providers, and Plivo and Exotel phone lines.
+**Step 3, tracing (done).** Every call can be sent to any OpenTelemetry backend (Jaeger, SigNoz, Grafana Tempo)
+by setting `OTEL_EXPORTER_OTLP_ENDPOINT`; without it, tracing stays off. Pipecat already traces a call as a
+`conversation` span with a `turn` span per exchange, and `stt`, `llm` and `tts` spans inside each turn that
+carry time to first byte, the model and token counts. `telemetry.py` adds the two things Pipecat cannot know
+about:
+
+- **A span for every tool call,** inside the turn that made it, marked as an error when the tool reports a
+  problem. It records the argument names only, since the values are callers' names and numbers.
+- **A span for every transfer,** inside its `transfer_to_staff` call but running on after the turn ends, for as
+  long as the caller holds. It records the reason, how many staff were at the desk and the outcome, with events
+  when the staff are briefed, accept or decline, and join the caller. The summary is left out: it names the
+  caller.
+
+![A transferred call in Jaeger: two turns, the tool call, and the 21.7 s transfer span with its events](docs/jaeger-transfer-trace.jpg)
+
+The call above, in Jaeger: the transfer span shows the caller held for 21.7 s, and that 15.6 s of that was the
+bot reading the briefing aloud before the scripted staff member, who waits to hear it all, pressed Accept. A
+person can accept from the written card while it plays.
+
+`evals/trace_check.py` stands in for the backend: it takes the bot's spans on Jaeger's port, runs the
+"connected" and "nobody at the desk" transfer calls, and checks that each call is one trace with the shape above,
+that the tool span is an error only when nobody was at the desk, and that the tool and transfer spans carry no
+caller details. **32 of 32** checks passed in each of two rounds, and the same calls were then viewed in Jaeger.
+Every tool now runs through the tracing wrapper even with tracing off; the schemas the model sees are unchanged,
+and the voice suite, which calls every tool, passed **13 of 13**.
+
+| What tracing showed | Fix |
+|---|---|
+| FastAPI traces the runner's `/start` request, so each call was a child of a 1 ms HTTP span | Each call starts its own trace, with the conversation at the root |
+| What the bot says on hold, and its handover line, belong to no turn, so their `tts` spans sit directly in the conversation | Correct as it is; the check allows it |
+| The 30 s answer timer starts after the spoken briefing ends, not when it starts, as the code comment said | The comment now says so |
+| An earlier, half-finished test run's spans arrived during the next run: the exporter retries spans a backend missed | The check picks calls by their start time |
 
 ## Run it
 
@@ -579,6 +613,18 @@ transfer test (close the staff page first, since it counts as someone at the des
 .\.venv\Scripts\python evals\transfer_call.py
 ```
 
+See the calls as traces. Download Jaeger for your platform from
+[its releases](https://github.com/jaegertracing/jaeger/releases) into `bin\jaeger\`, start it, start the bot
+with the endpoint set, make calls, and open http://localhost:16686. To run the trace check instead, stop Jaeger
+first: the check listens on the same port.
+
+```powershell
+.\bin\jaeger\jaeger.exe
+$env:OTEL_EXPORTER_OTLP_ENDPOINT = "http://localhost:4318"
+.\.venv\Scripts\python bot.py -t livekit
+.\.venv\Scripts\python evals\trace_check.py
+```
+
 Run the evals and write the report. The grounding test calls Claude directly and takes a few minutes; the voice
 suite starts a fresh bot for every call and takes about 17 minutes:
 
@@ -598,11 +644,12 @@ $env:APPOINTMENTS_DB = "fresh"
 | `tools.py` | The appointment book, messages, and the tools the LLM can call |
 | `transfer.py` | The warm transfer: hold, the private briefing, the handover and the fallback to a message |
 | `staff.py`, `staff.html` | The front desk page staff keep open to take transfers |
+| `telemetry.py` | OpenTelemetry: sends Pipecat's spans to a backend, and adds spans for tool calls and transfers |
 | `rag.py` | Retrieval: chunking, embeddings, the booking check, and attaching facts to a caller's turn |
 | `knowledge/` | The clinic's documents |
-| `evals/` | Voice scenarios and manifest, the grounding test, labelled retrieval questions, a test of the facts processor, the report script, a Twilio call simulator, a scripted LiveKit caller, the transfer test and a check of how Whisper hears the clinic's names |
+| `evals/` | Voice scenarios and manifest, the grounding test, labelled retrieval questions, a test of the facts processor, the report script, a Twilio call simulator, a scripted LiveKit caller, the transfer test, the trace check and a check of how Whisper hears the clinic's names |
 | `eval_services.py` | The simulated caller's voice for the eval harness |
-| `docs/` | The eval report and the editable diagrams |
+| `docs/` | The eval report, the editable diagrams and a Jaeger screenshot |
 
 ## Known limits and what is next
 
@@ -626,5 +673,8 @@ $env:APPOINTMENTS_DB = "fresh"
 - **Transfers need LiveKit.** On the browser client and the Twilio line the bot can only take a message.
 - **A caller on hold cannot change their mind:** their words are dropped until staff answer or the bot comes
   back, so "never mind" is not heard.
+- **Traces hold what callers said.** Pipecat's own spans record the transcripts and the messages sent to the
+  model, so names and numbers reach the trace backend; only this project's spans leave them out. A real clinic
+  would need to strip those attributes before export, or keep traces under the same rules as call recordings.
 - **One desk, first to accept wins.** There is no queue order, no skills routing and no transfer to a staff
   member's phone, which would need LiveKit's SIP service.
