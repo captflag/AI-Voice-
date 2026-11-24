@@ -59,12 +59,15 @@ def digits(phone):
     """A phone number as its 10 digits.
 
     The clinic is in the US (prices in dollars, Medicare, US insurers), so a number has 10 digits, or 11 with
-    the leading 1 that caller ID adds. Anything else is refused rather than stored: speech-to-text drops a
-    digit from runs like "three three three three", and the evals caught bookings made under 9-digit numbers.
+    the leading 1 that caller ID adds. Caller ID from an Indian line (Exotel, Plivo) has 10 digits too, after
+    a leading 0 or 91, which no US number starts with. Anything else is refused rather than stored:
+    speech-to-text drops a digit from runs like "three three three three", and the evals caught bookings made
+    under 9-digit numbers.
     """
     number = "".join(ch for ch in phone if ch.isdigit())
-    if len(number) == 11 and number.startswith("1"):
-        number = number[1:]
+    for prefix in ("1", "0", "91"):
+        if len(number) == 10 + len(prefix) and number.startswith(prefix):
+            number = number[len(prefix):]
     if len(number) != 10:
         raise Refused(f"That phone number has {len(number)} digits, but numbers here have 10; speech recognition "
                       "often drops a repeated digit. Ask the caller to type the number on their keypad and press the "
@@ -261,6 +264,7 @@ def check():
         assert say(new) == "Tuesday 24 November at 2:00 PM", say(new)
         leave_message(db, "Kim Park", "(741) 333-3333", "Wants to dispute a bill", now)
         assert db.execute("SELECT name, phone FROM messages").fetchall() == [("Kim Park", "7413333333")]
+        assert {digits(n) for n in ("+1 741-333-3333", "07413333333", "+917413333333", "917413333333")} == {"7413333333"}
     print("appointment book ok")
 
 

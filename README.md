@@ -28,7 +28,7 @@ flowchart TB
     browser["Browser caller<br/>WebRTC"]
     room["LiveKit room<br/>local server, scripted caller"]
     sim["Simulated callers<br/>eval harness"]
-    phone["Phone caller<br/>Twilio, built, not yet live"]:::planned
+    phone["Phone caller<br/>Twilio, Plivo or Exotel, built, not yet live"]:::planned
 
     transport["Pipecat transport<br/>audio in and out, echo cancelled by the browser"]
 
@@ -120,7 +120,7 @@ Each phase is one or two commits, so the history reads in the same order as this
 | 5 | Booking tools | Tool turns take two LLM round trips |
 | 6 | Automated voice evals | p50 3.5 s, p95 4.6 s with the harness sharing the machine |
 | 7 | Clinic knowledge base, keypad entry for phone numbers | p50 3.5 s, p95 4.9 s in the eval run; retrieval adds 17 to 37 ms a turn |
-| 8 (in progress) | LiveKit rooms, a warm transfer to a person at the front desk, OpenTelemetry traces, a switchable cloud voice | 1.6 to 2.2 s on scripted LiveKit calls |
+| 8 (in progress) | LiveKit rooms, a warm transfer to a person at the front desk, OpenTelemetry traces, a switchable cloud voice, Plivo and Exotel phone lines | 1.6 to 2.2 s on scripted LiveKit calls |
 
 "Simulated" means synthetic caller audio fed through the real pipeline with playback muted. "Live" means a
 person talking into a microphone.
@@ -562,6 +562,34 @@ fails, and that found the worst outcome a phone line can have:
 transfer calls (10 of 10 checks). On the default voice the full transfer test passed 19 of 19 and the voice suite
 13 of 13.
 
+**Step 5, Plivo and Exotel (built; not yet on a real number).** Plivo and Exotel, the phone providers most used
+in India, now reach the bot the same way Twilio does: the provider streams the call's audio over a websocket.
+Pipecat's runner tells the three apart by their first message and converts each one's audio (mu-law for Twilio
+and Plivo, raw 16-bit audio for Exotel), so one running bot answers all three. Three things in the bot were
+Twilio-only:
+
+- **Caller ID.** Exotel sends the caller's number with the call; Twilio's is looked up through its REST API,
+  which the bot used to try for every phone call; Plivo's stream carries none, so the bot asks for it.
+- **Number formats.** An Indian caller ID comes as 0 or 91 followed by 10 digits. Both prefixes are now dropped,
+  as the leading 1 of a US number already was; no US number starts with 0 or 91 at that length. Caller ID is
+  cut down to its 10 digits before the model sees it, so it is read back and booked in the same form as a typed
+  number.
+- **Hanging up.** Twilio and Plivo calls are ended through each provider's API, with the account's credentials.
+  Exotel's stream has no hang-up message: the bot closes the stream, and the Exotel call flow moves on to its
+  next step, which should be a hang-up.
+
+`evals/phone_call.py`, the Twilio call simulator, now speaks all three protocols. The caller books a cleaning;
+on Twilio and Plivo they type their number on the keypad, and on Exotel it comes with the call in India's
+`09876501234` form. Over three rounds, each on a fresh bot, every turn on every line was answered and each
+round booked all three calls under the right number and time. Replies started 2.4 to 3.2 s after the caller
+finished.
+
+| What the simulated calls found | Fix |
+|---|---|
+| With a number from caller ID, the bot checked it with a question of its own ("Is 98765 01234 the right number?") and once took the yes to that as the go-ahead to book, without reading the name back | The prompt now says to read a caller ID number back with the rest of the booking, not on its own. Over four more Exotel calls the whole number was read out before every booking; one call still asked about the number separately first, and one asked "shall I book it?" before its readback |
+| The simulator crashed when the bot hung up on a caller who said "yes" to "anything else?" | The bot was right to end the call; the simulator now treats the bot hanging up as the end of the call |
+| A second round on the same bot found every slot taken: the calls share one bot and one appointment book | Each line asks for a different time, and each round starts a fresh bot |
+
 ## Run it
 
 Tested on Windows 10 with Python 3.13, an Intel i5-10400F and a GTX 1660 (6 GB). An NVIDIA GPU is optional but
@@ -610,6 +638,17 @@ cloudflared tunnel --url http://localhost:7860
 $env:TWILIO_ACCOUNT_SID = "your-account-sid"
 $env:TWILIO_AUTH_TOKEN = "your-auth-token"
 .\.venv\Scripts\python bot.py -t twilio -x your-tunnel-host
+```
+
+Plivo and Exotel numbers work the same way. For Plivo, set `PLIVO_AUTH_ID` and `PLIVO_AUTH_TOKEN` and start the
+bot with `-t plivo`; for Exotel, start it with `-t exotel` and point a Voicebot applet in the call flow at the
+bot's `/ws` address, with a hang-up after it. To try any of the three without an account, start the bot with
+placeholder credentials and run the call simulator with the line to imitate:
+
+```powershell
+$env:TWILIO_ACCOUNT_SID = "ACtest"; $env:TWILIO_AUTH_TOKEN = "test"; $env:PLIVO_AUTH_ID = "MAtest"; $env:PLIVO_AUTH_TOKEN = "test"
+.\.venv\Scripts\python bot.py -t twilio -x localhost:7870 --port 7870
+.\.venv\Scripts\python evals\phone_call.py 7870 exotel
 ```
 
 Call the bot through a LiveKit room. Download `livekit-server` for your platform from
@@ -669,21 +708,21 @@ $env:APPOINTMENTS_DB = "fresh"
 | File | What it is |
 |---|---|
 | `voice_loop.py` | The pipeline by hand: VAD, endpointing, speech-to-text, LLM streaming, voice, interruptions |
-| `bot.py` | The same receptionist on Pipecat: browser, LiveKit, Twilio and eval transports |
+| `bot.py` | The same receptionist on Pipecat: browser, LiveKit, Twilio, Plivo, Exotel and eval transports |
 | `tools.py` | The appointment book, messages, and the tools the LLM can call |
 | `transfer.py` | The warm transfer: hold, the private briefing, the handover and the fallback to a message |
 | `staff.py`, `staff.html` | The front desk page staff keep open to take transfers |
 | `telemetry.py` | OpenTelemetry: sends Pipecat's spans to a backend, and adds spans for tool calls and transfers |
 | `rag.py` | Retrieval: chunking, embeddings, the booking check, and attaching facts to a caller's turn |
 | `knowledge/` | The clinic's documents |
-| `evals/` | Voice scenarios and manifest, the grounding test, labelled retrieval questions, a test of the facts processor, the report script, a Twilio call simulator, a scripted LiveKit caller, the transfer test, the trace check, the voice failover scenarios and a check of how Whisper hears the clinic's names |
+| `evals/` | Voice scenarios and manifest, the grounding test, labelled retrieval questions, a test of the facts processor, the report script, a phone call simulator for Twilio, Plivo and Exotel, a scripted LiveKit caller, the transfer test, the trace check, the voice failover scenarios and a check of how Whisper hears the clinic's names |
 | `eval_services.py` | The simulated caller's voice for the eval harness |
 | `docs/` | The eval report, the editable diagrams and a Jaeger screenshot |
 
 ## Known limits and what is next
 
-- **The phone line is not live.** The Twilio path is built and passes a simulated call, but no real number is
-  attached yet.
+- **The phone line is not live.** The Twilio, Plivo and Exotel paths are built and pass simulated calls, but no
+  real number is attached yet.
 - **The calendar is a local SQLite file,** not an external calendar service.
 - **Not deployed.** It runs on one machine with a local GPU.
 - **Any speech interrupts the bot,** including a short "mm-hm".
@@ -694,7 +733,9 @@ $env:APPOINTMENTS_DB = "fresh"
   that size; it has not been tested on hundreds of documents.
 - **The booking check has a thin margin.** "Are you open on Saturdays" keeps its facts by 0.04, and 6 of 60
   booking-call turns still get facts they do not need, which costs tokens but not accuracy.
-- **Phone numbers are assumed to be US numbers** of 10 digits.
+- **Phone numbers are assumed to be 10 digits:** US numbers, or Indian ones once a leading 0 or 91 is dropped.
+- **Plivo calls carry no caller ID** in their stream, so the bot asks for the number; it could be looked up
+  through Plivo's API, as Twilio's is.
 - **Keypad entry is tested through the eval harness only,** not yet in a live browser or phone call.
 - **LiveKit is tested with a scripted caller on a local server,** not yet with a person on a microphone or a
   hosted LiveKit server.

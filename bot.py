@@ -31,7 +31,7 @@ from opentelemetry import context as otel_context
 # Importing voice_loop also puts the NVIDIA DLLs on PATH, which Whisper needs here too.
 import rag
 import telemetry
-from tools import TOOLS
+from tools import TOOLS, Refused, digits
 from voice_loop import MODEL, MODELS_DIR, VOICE
 
 KNOWLEDGE = rag.Index()  # the clinic's documents, embedded once when the server starts
@@ -180,16 +180,17 @@ class ClinicNotes(FrameProcessor):
         await self.push_frame(frame, direction)
 
 
-async def caller_number(call):
-    """The phone number a Twilio call came from, or None if it cannot be found.
+async def caller_number(call, provider):
+    """The phone number a call came from, or None if it cannot be found.
 
-    Twilio sends it with the call only when the TwiML passes it as a stream parameter. The development
-    runner's TwiML does not, so the usual route is to look the call up through Twilio's REST API.
+    Exotel sends it with the call. Twilio sends it only when the TwiML passes it as a stream parameter, which
+    the development runner's TwiML does not, so for Twilio the usual route is its REST API. Plivo's stream does
+    not carry it, so on Plivo the bot asks.
     """
     if call.from_number:
         return call.from_number
     sid, token = os.getenv("TWILIO_ACCOUNT_SID"), os.getenv("TWILIO_AUTH_TOKEN")
-    if not (sid and token and call.call_id):
+    if not (provider == "twilio" and sid and token and call.call_id):
         return None
     url = f"https://api.twilio.com/2010-04-01/Accounts/{sid}/Calls/{call.call_id}.json"
     try:
@@ -216,8 +217,11 @@ async def bot(runner_args: RunnerArguments):
                 # Hold music for transfers, silent until a transfer turns it on.
                 audio_out_mixer=SoundfileMixer(sound_files={"hold": transfer.hold_music()}, default_sound="hold",
                                                volume=0.3, mixing=False)),
-            # A phone call through Twilio. The runner adds the Twilio audio format itself.
+            # Phone calls through Twilio, Plivo or Exotel. The runner tells them apart by their first message and
+            # adds each one's audio format (mu-law for Twilio and Plivo, raw 16-bit audio for Exotel) itself.
             "twilio": lambda: FastAPIWebsocketParams(audio_in_enabled=True, audio_out_enabled=True),
+            "plivo": lambda: FastAPIWebsocketParams(audio_in_enabled=True, audio_out_enabled=True),
+            "exotel": lambda: FastAPIWebsocketParams(audio_in_enabled=True, audio_out_enabled=True),
             # Lets Pipecat's eval harness connect as a caller (see evals/).
             "eval": lambda: EvalTransportParams(audio_in_enabled=True, audio_out_enabled=True),
         },
@@ -225,11 +229,15 @@ async def bot(runner_args: RunnerArguments):
 
     system = SYSTEM.format(today=date.today())
     call = getattr(runner_args, "call_data", None)  # set for phone calls only
-    number = await caller_number(call) if call else None
+    number = await caller_number(call, runner_args.transport_type) if call else None
+    try:
+        number = digits(number) if number else None  # +1..., 0... and +91... caller IDs, as the 10 digits the tools want
+    except Refused:
+        number = None  # not a number the clinic can store, so the bot asks for one
     if number:
         system += (
             f" The caller is phoning from {number}. Use that as their phone number: do not ask them to say a "
-            "number, just check once that it is the right one to reach them on."
+            "number, and do not check it on its own; it is read back with the rest before booking, like any number."
         )
 
     stt = WhisperSTTService(
