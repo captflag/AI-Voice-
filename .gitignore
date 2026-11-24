@@ -3,3 +3,4 @@ __pycache__/
 models/
 appointments.db
 evals/runs/
+bin/

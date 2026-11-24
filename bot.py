@@ -78,12 +78,13 @@ from pipecat.processors.aggregators.dtmf_aggregator import DTMFAggregator
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.frame_processor import FrameProcessor
 from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair, LLMUserAggregatorParams
-from pipecat.runner.types import RunnerArguments
+from pipecat.runner.types import LiveKitRunnerArguments, RunnerArguments
 from pipecat.runner.utils import create_transport
 from pipecat.services.anthropic.llm import AnthropicLLMService
 from pipecat.services.kokoro.tts import KokoroTTSService
 from pipecat.services.whisper.stt import WhisperSTTService
 from pipecat.transports.base_transport import TransportParams
+from pipecat.transports.livekit.transport import LiveKitParams
 from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams
 from pipecat.workers.runner import WorkerRunner
 
@@ -101,6 +102,9 @@ from pipecat.workers.runner import WorkerRunner
 # Tried and removed: requiring three recognised words before a turn could start (MinWordsUserTurnStartStrategy).
 # It made a turn start only once its transcript arrived, which added a fixed 0.8 s wait to every reply.
 MIN_VOLUME = 0.72
+
+
+HOTWORDS = "Bright Smile Dental, Cigna, Delta Dental, MetLife, Aetna, Medicare, Apple Pay, Riverside Orthodontics"
 
 
 class LoudnessLoggingVAD(SileroVADAnalyzer):
@@ -167,6 +171,8 @@ async def bot(runner_args: RunnerArguments):
         runner_args,
         {
             "webrtc": lambda: TransportParams(audio_in_enabled=True, audio_out_enabled=True),
+            # A LiveKit room: the base for adding a second person (a staff member) to the call.
+            "livekit": lambda: LiveKitParams(audio_in_enabled=True, audio_out_enabled=True),
             # A phone call through Twilio. The runner adds the Twilio audio format itself.
             "twilio": lambda: FastAPIWebsocketParams(audio_in_enabled=True, audio_out_enabled=True),
             # Lets Pipecat's eval harness connect as a caller (see evals/).
@@ -186,7 +192,8 @@ async def bot(runner_args: RunnerArguments):
     stt = WhisperSTTService(
         device="cuda" if ctranslate2.get_cuda_device_count() else "cpu",
         compute_type="float32" if ctranslate2.get_cuda_device_count() else "int8",
-        settings=WhisperSTTService.Settings(model="base.en"),
+        # Names from the clinic documents that Whisper otherwise mishears ("Cigna" came out as "signal").
+        settings=WhisperSTTService.Settings(model="base.en", hotwords=HOTWORDS),
     )
     llm = AnthropicLLMService(
         api_key=os.environ["ANTHROPIC_API_KEY"],
@@ -242,7 +249,7 @@ async def bot(runner_args: RunnerArguments):
             await worker.queue_frames([LLMRunFrame()])
 
     worker.rtvi.event_handler("on_client_ready")(greet)
-    if call:
+    if call or isinstance(runner_args, LiveKitRunnerArguments):  # these callers may not send "client ready"
         transport.event_handler("on_client_connected")(greet)
 
     @transport.event_handler("on_client_disconnected")

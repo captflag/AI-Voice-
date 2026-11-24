@@ -2,7 +2,7 @@ anthropic
 faster-whisper
 kokoro-onnx[gpu]
 numpy
-pipecat-ai[webrtc,silero,whisper,anthropic,runner]
+pipecat-ai[webrtc,livekit,silero,whisper,anthropic,runner]
 sounddevice
 # For the eval harness (python -m pipecat.evals). Pipecat's own [evals] extra pulls in far more and
 # downgrades huggingface_hub, so only the two packages it actually needs here are listed.

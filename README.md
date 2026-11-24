@@ -12,8 +12,9 @@ of the project: what a voice framework gives you, and what you still have to und
 Everything runs locally except the LLM: speech-to-text is Whisper, the voice is Kokoro, voice detection is
 Silero, retrieval embeddings are BGE-small, and the model is Claude Haiku 5.5.
 
-**Latest results:** 36 of 36 simulated voice calls passed (12 scenarios, three runs each), and 210 of 210 replies
-passed the grounding test (21 cases, ten runs each). Details in [phase 7](#phase-7-clinic-knowledge-base) and
+**Latest results:** 36 of 36 simulated voice calls passed (12 scenarios, three runs each, after the phase 8
+speech-to-text change), and 210 of 210 replies passed the grounding test (21 cases, ten runs each). Details in
+[phase 7](#phase-7-clinic-knowledge-base), [phase 8](#phase-8-handing-a-call-to-a-person-in-progress) and
 [docs/eval-report.md](docs/eval-report.md).
 
 ## System design
@@ -23,13 +24,14 @@ Solid boxes are built. Dashed boxes are planned.
 ```mermaid
 flowchart TB
     browser["Browser caller<br/>WebRTC"]
+    room["LiveKit room<br/>local server, scripted caller"]
     sim["Simulated callers<br/>eval harness"]
     phone["Phone caller<br/>Twilio, built, not yet live"]:::planned
 
     transport["Pipecat transport<br/>audio in and out, echo cancelled by the browser"]
 
     subgraph pipeline["Pipeline (bot.py)"]
-        stt["Speech-to-text<br/>Whisper base.en on GPU"]
+        stt["Speech-to-text<br/>Whisper base.en on GPU, clinic names as hotwords"]
         keypad["Keypad entry<br/>DTMF digits"]
         turn["Turn detection<br/>Silero VAD + Smart Turn"]
         notes["Clinic facts (rag.py)<br/>retrieval before the LLM"]
@@ -46,6 +48,7 @@ flowchart TB
     report["Eval report<br/>pass rate, p50/p95, cost"]
 
     browser -->|WebRTC| transport
+    room -->|LiveKit| transport
     sim -->|test audio| transport
     phone -.->|phone line| transport
     transport -->|audio in| stt
@@ -109,6 +112,7 @@ Each phase is one or two commits, so the history reads in the same order as this
 | 5 | Booking tools | Tool turns take two LLM round trips |
 | 6 | Automated voice evals | p50 3.5 s, p95 4.6 s with the harness sharing the machine |
 | 7 | Clinic knowledge base, keypad entry for phone numbers | p50 3.5 s, p95 4.9 s in the eval run; retrieval adds 17 to 37 ms a turn |
+| 8 (in progress) | LiveKit rooms, the base for handing a call to a person | 1.6 to 2.2 s on scripted LiveKit calls |
 
 "Simulated" means synthetic caller audio fed through the real pipeline with playback muted. "Live" means a
 person talking into a microphone.
@@ -384,6 +388,53 @@ Reply latency was p50 3.5 s and p95 4.9 s over 16 replies, with stage medians of
 moved between 2.9 and 3.5 s: with 16 to 18 timed replies a run, it mostly reflects how many of them needed a
 tool call. LLM cost was $0.0007 a call, or $0.0015 a minute of call.
 
+### Phase 8: handing a call to a person (in progress)
+
+The goal is a warm transfer: the bot puts the caller on hold, briefs a member of staff privately, then connects
+them and leaves. That needs three people in one call, and every transport so far connects one caller to the
+bot. So the first step moves the call into a [LiveKit](https://livekit.io) room, where any number of people can
+join.
+
+```mermaid
+flowchart LR
+    caller["Caller<br/>scripted, evals/livekit_call.py"]
+    server["LiveKit server<br/>local, dev mode"]
+    bot["Bot<br/>python bot.py -t livekit"]
+    staff["Staff member<br/>next step"]:::planned
+    caller <-->|room audio| server
+    bot <-->|room audio| server
+    staff -.->|joins on transfer| server
+    classDef planned stroke-dasharray: 5 5
+```
+
+**Step 1, LiveKit (done).** The bot joins a room on a local LiveKit server; Pipecat's runner creates the room and
+the tokens. A browser microphone was not available for testing, so `evals/livekit_call.py` is a scripted caller:
+it joins the room, speaks with a Kokoro voice, waits for each reply, transcribes it with Whisper and checks
+that the bot leaves after saying goodbye. Two calls of three questions each passed. The bot measured its replies
+starting 1.6 to 2.2 s after the caller stopped, in line with the WebRTC client; measured from the caller's side,
+including the room's network path and audio buffering, they started 2.0 to 3.0 s after.
+
+The first call caught a speech-to-text error that no earlier test had: Whisper heard "Do you take Cigna?" as
+"Do you take signal?", so the bot said it was not sure. The clinic's names are now passed to Whisper as
+hotwords. `evals/stt_names.py` speaks each name in three voices:
+
+| Name | Heard right without hotwords | With hotwords |
+|---|---|---|
+| Cigna | 0 of 3 ("signal", "signa", "sigma") | 3 of 3 |
+| Aetna | 0 of 3 ("eat now", "eating her", "Itna") | 2 of 3 |
+| MetLife | 2 of 3 | 3 of 3 |
+| Delta Dental, Apple Pay, phone numbers, booking lines | unchanged | unchanged |
+
+Hotwords change every call, so the full voice suite was run again: **36 of 36**, with replies at p50 3.2 s and
+p95 4.0 s ([docs/eval-report.md](docs/eval-report.md)). A first attempt scored 31 of 36 because it was started
+without `APPOINTMENTS_DB=fresh`: the three runs shared one appointment book, so the second booking of
+"Wednesday at 10:30" found the slot taken. The other failure in that attempt was the bot answering a Botox
+question with "I'm not sure" and then listing three correct prices nobody asked for, which the scenario counts as
+quoting a price.
+
+**Next:** the warm transfer itself, then tracing with OpenTelemetry, switchable cloud speech providers, and
+Plivo and Exotel phone lines.
+
 ## Run it
 
 Tested on Windows 10 with Python 3.13, an Intel i5-10400F and a GTX 1660 (6 GB). An NVIDIA GPU is optional but
@@ -434,6 +485,17 @@ $env:TWILIO_AUTH_TOKEN = "your-auth-token"
 .\.venv\Scripts\python bot.py -t twilio -x your-tunnel-host
 ```
 
+Call the bot through a LiveKit room. Download `livekit-server` for your platform from
+[LiveKit's releases](https://github.com/livekit/livekit/releases) into `bin\livekit\`, start it, start the bot,
+and in a third terminal run the scripted caller:
+
+```powershell
+.\bin\livekit\livekit-server.exe --dev
+$env:LIVEKIT_URL = "ws://127.0.0.1:7880"; $env:LIVEKIT_API_KEY = "devkey"; $env:LIVEKIT_API_SECRET = "secret"
+.\.venv\Scripts\python bot.py -t livekit
+.\.venv\Scripts\python evals\livekit_call.py
+```
+
 Run the evals and write the report. The grounding test calls Claude directly and takes a few minutes; the voice
 suite starts a fresh bot for every call and takes about 17 minutes:
 
@@ -449,11 +511,11 @@ $env:APPOINTMENTS_DB = "fresh"
 | File | What it is |
 |---|---|
 | `voice_loop.py` | The pipeline by hand: VAD, endpointing, speech-to-text, LLM streaming, voice, interruptions |
-| `bot.py` | The same receptionist on Pipecat, with a browser client |
+| `bot.py` | The same receptionist on Pipecat: browser, LiveKit, Twilio and eval transports |
 | `tools.py` | The appointment book and the tools the LLM can call |
 | `rag.py` | Retrieval: chunking, embeddings, the booking check, and attaching facts to a caller's turn |
 | `knowledge/` | The clinic's documents |
-| `evals/` | Voice scenarios and manifest, the grounding test, labelled retrieval questions, a test of the facts processor, the report script and a Twilio call simulator |
+| `evals/` | Voice scenarios and manifest, the grounding test, labelled retrieval questions, a test of the facts processor, the report script, a Twilio call simulator, a scripted LiveKit caller and a check of how Whisper hears the clinic's names |
 | `eval_services.py` | The simulated caller's voice for the eval harness |
 | `docs/` | The eval report and the editable diagrams |
 
@@ -473,3 +535,6 @@ $env:APPOINTMENTS_DB = "fresh"
   booking-call turns still get facts they do not need, which costs tokens but not accuracy.
 - **Phone numbers are assumed to be US numbers** of 10 digits.
 - **Keypad entry is tested through the eval harness only,** not yet in a live browser or phone call.
+- **LiveKit is tested with a scripted caller on a local server,** not yet with a person on a microphone or a
+  hosted LiveKit server.
+- **Aetna is still misheard** in one voice of three, even with hotwords.
