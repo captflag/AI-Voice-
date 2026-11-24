@@ -48,9 +48,19 @@ def parse(date, clock):
 
 
 def digits(phone):
+    """A phone number as its 10 digits.
+
+    The clinic is in the US (prices in dollars, Medicare, US insurers), so a number has 10 digits, or 11 with
+    the leading 1 that caller ID adds. Anything else is refused rather than stored: speech-to-text drops a
+    digit from runs like "three three three three", and the evals caught bookings made under 9-digit numbers.
+    """
     number = "".join(ch for ch in phone if ch.isdigit())
-    if len(number) < 7:
-        raise Refused("That phone number looks too short. Ask the caller to say it again, digit by digit.")
+    if len(number) == 11 and number.startswith("1"):
+        number = number[1:]
+    if len(number) != 10:
+        raise Refused(f"That phone number has {len(number)} digits, but numbers here have 10; speech recognition "
+                      "often drops a repeated digit. Ask the caller to type the number on their keypad and press the "
+                      "pound key.")
     return number
 
 
@@ -134,7 +144,7 @@ async def book_appointment(params, date: str, time: str, name: str, phone: str, 
         date: The day, as YYYY-MM-DD.
         time: The start time in 24-hour HH:MM, on the hour or half hour.
         name: The caller's full name.
-        phone: The caller's phone number, digits only.
+        phone: The caller's 10-digit phone number, digits only.
         service: What the visit is for, such as cleaning, check-up or filling.
     """
     try:
@@ -149,7 +159,7 @@ async def reschedule_appointment(params, phone: str, new_date: str, new_time: st
     """Move the caller's existing appointment to a new time. It is looked up by phone number.
 
     Args:
-        phone: The phone number the appointment was booked under, digits only.
+        phone: The 10-digit phone number the appointment was booked under, digits only.
         new_date: The new day, as YYYY-MM-DD.
         new_time: The new start time in 24-hour HH:MM, on the hour or half hour.
     """
@@ -184,7 +194,7 @@ def check():
         assert free_slots(db, now.date(), now)[0] == datetime(2026, 11, 23, 10, 30)  # today: only what is still ahead
         assert free_slots(db, datetime(2026, 11, 28).date(), now) == []             # Saturday
 
-        book(db, tuesday.replace(hour=9, minute=30), "Sam Lee", "741 333 333", "cleaning", now)
+        book(db, tuesday.replace(hour=9, minute=30), "Sam Lee", "741 333 3333", "cleaning", now)
         assert tuesday.replace(hour=9, minute=30) not in free_slots(db, tuesday.date(), now)
 
         for when, reason in ((tuesday.replace(hour=9, minute=30), "taken"), (tuesday.replace(hour=18), "opening hours"),
@@ -196,9 +206,9 @@ def check():
             except Refused as problem:
                 assert reason in str(problem), problem
 
-        old, new = reschedule(db, "741-333-333", tuesday.replace(hour=14), now)
+        old, new = reschedule(db, "+1 741-333-3333", tuesday.replace(hour=14), now)  # caller ID form
         assert (old.hour, new.hour) == (9, 14) and len(free_slots(db, tuesday.date(), now)) == 15
-        for call in (lambda: reschedule(db, "0000000000", tuesday.replace(hour=15), now), lambda: digits("12"),
+        for call in (lambda: reschedule(db, "0000000000", tuesday.replace(hour=15), now), lambda: digits("12"), lambda: digits("741 333 333"),
                      lambda: parse("next tuesday", "9am")):
             try:
                 call()

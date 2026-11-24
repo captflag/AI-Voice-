@@ -1,0 +1,84 @@
+# Labelled questions for measuring retrieval (python rag.py --eval).
+# Written the way a caller would say them, not in the documents' own words.
+# `sections` lists every section that answers the question; an empty list means nothing should be retrieved.
+
+answerable:
+  - {q: "how much is a teeth cleaning", sections: ["Routine cleaning"]}
+  - {q: "what do you charge for a check up with x rays", sections: ["Check-up and X-rays"]}
+  - {q: "I think I need a filling what would that cost me", sections: ["Fillings"]}
+  - {q: "do you guys do whitening and how much", sections: ["Teeth whitening"]}
+  - {q: "what's the price of a crown", sections: ["Root canals and crowns"]}
+  - {q: "how much to bring my six year old in for a check up", sections: ["Children"]}
+  - {q: "do you do braces or invisalign", sections: ["Treatments we do not offer"]}
+  - {q: "can I get an implant there", sections: ["Treatments we do not offer"]}
+  - {q: "do you take cigna", sections: ["Insurance plans we accept"]}
+  - {q: "I have aetna is that okay", sections: ["Insurance plans we accept"]}
+  - {q: "do I have to pay the whole thing up front or do you bill my insurance", sections: ["How insurance billing works"]}
+  - {q: "I don't have any dental insurance what are my options", sections: ["Patients without insurance"]}
+  - {q: "can I pay with apple pay", sections: ["Ways to pay"]}
+  - {q: "do you accept checks", sections: ["Ways to pay"]}
+  - {q: "can I pay in installments for a big treatment", sections: ["Payment plans"]}
+  - {q: "what time do you close", sections: ["Opening hours"]}
+  - {q: "are you open on saturdays", sections: ["Opening hours"]}
+  - {q: "where are you located", sections: ["Address"]}
+  - {q: "is there somewhere to park", sections: ["Parking"]}
+  - {q: "which bus goes to the clinic", sections: ["Public transport"]}
+  - {q: "I use a wheelchair can I get in", sections: ["Accessibility"]}
+  - {q: "what should I bring to my first appointment", sections: ["What to bring"]}
+  - {q: "how early should I get there", sections: ["When to arrive"]}
+  - {q: "how long will my first visit take", sections: ["How long it takes"]}
+  - {q: "should I eat before I come in", sections: ["Before you come"]}
+  - {q: "I'm really scared of the dentist can you help with that", sections: ["Nervous patients"]}
+  - {q: "what happens if I need to cancel", sections: ["Cancelling or rescheduling"]}
+  - {q: "is there a fee if I miss my appointment", sections: ["Late cancellations and missed appointments"]}
+  - {q: "I'm running about twenty minutes late is that a problem", sections: ["Running late"]}
+  - {q: "my tooth got knocked out what do I do", sections: ["What counts as an emergency", "Emergencies during opening hours"]}
+  - {q: "who do I call if I have terrible pain at night", sections: ["Emergencies when we are closed"]}
+  - {q: "how much is an emergency appointment", sections: ["Emergencies during opening hours"]}
+  # The kind of thing speech-to-text produces
+  - {q: "how much is a clean in", sections: ["Routine cleaning"]}
+  - {q: "do you take delta dental insurance or met life", sections: ["Insurance plans we accept"]}
+
+  # Added after a voice eval failed on "leave my car": harder rewordings, written before looking at their scores
+  - {q: "is there anywhere to leave my car when I come in", sections: ["Parking"]}
+  - {q: "where can I leave my car", sections: ["Parking"]}
+  - {q: "my kid is two is it free for her", sections: ["Children"]}
+  - {q: "what if I can't make it to my appointment", sections: ["Cancelling or rescheduling", "Late cancellations and missed appointments"]}
+  - {q: "how do I get there by public transit", sections: ["Public transport"]}
+  - {q: "is the office on the ground floor", sections: ["Address", "Accessibility"]}
+  - {q: "do I need to stop eating before the appointment", sections: ["Before you come"]}
+  - {q: "what cards do you accept", sections: ["Ways to pay"]}
+  - {q: "can someone see me today my face is swollen", sections: ["What counts as an emergency", "Emergencies during opening hours"]}
+  - {q: "what does laughing gas cost", sections: ["Nervous patients"]}
+
+  # Booking and a clinic question in the same breath: the notes must still arrive
+  - {q: "I'd like to book a cleaning, how much does that cost", sections: ["Routine cleaning"]}
+  - {q: "can I book a check up next week and do you take cigna", sections: ["Insurance plans we accept", "Check-up and X-rays"]}
+  - {q: "I want to come in on Thursday, is there parking near you", sections: ["Parking"]}
+  - {q: "please book me in for whitening, what does it cost", sections: ["Teeth whitening"]}
+  - {q: "I need to reschedule, is there a fee for that", sections: ["Cancelling or rescheduling", "Late cancellations and missed appointments"]}
+
+nothing_expected:
+  # Ordinary conversation: no clinic fact is being asked for
+  - {q: "yes that's correct"}
+  - {q: "my name is Sam Lee"}
+  - {q: "hello"}
+  - {q: "okay thank you goodbye"}
+  - {q: "can you hear me"}
+  - {q: "my number is five five five zero one four two two three seven"}
+  # Questions the documents do not answer
+  - {q: "what's the weather like today"}
+  - {q: "do you sell electric toothbrushes"}
+  - {q: "is doctor patel in today"}
+  - {q: "do you offer botox"}
+  # Held out: caller turns copied from real eval call logs, booking and details only
+  - {q: "Hi, I'd like to book a cleaning for next Wednesday at 10.30 in the morning."}
+  - {q: "Hi, I'd like to book a cleaning for next Wednesday at 10.30 in the morning. My name is Sam Lee"}
+  - {q: "And my number is 555."}
+  - {q: "I'm Kim Park and my number is 741-333-333."}
+  - {q: "I mean the nearest Wednesday."}
+  - {q: "Yes, that's all correct. I mean the nearest Wednesday."}
+  - {q: "Actually, please move that appointment to two PM on the same day."}
+  - {q: "Hello, I need a checkup next Thursday at 9 in the morning."}
+  - {q: "I'd like a cleaning next Tuesday at 3 in the afternoon."}
+  - {q: "Sorry, I think I have the wrong number. Goodbye."}

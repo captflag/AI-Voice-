@@ -2,7 +2,10 @@
 # speech-to-text and turn detection are exercised for real. Checks are deterministic: which tool the
 # bot called and with what arguments, what its LLM wrote, and how quickly it started or stopped speaking.
 #
-# Dates are never pinned ("next Wednesday" resolves on the day of the run), so these hold on any day.
+# Dates are never pinned ("next Wednesday" resolves on the day of the run), so these hold on any day. The caller
+# agrees to whichever date the bot reads back: a yes with a date correction in the same breath ("Yes, that's all
+# correct. I mean the nearest Wednesday.") made the bot re-confirm the new date instead of booking, which is fair
+# receptionist behaviour but not what these scenarios test.
 
 name: receptionist
 
@@ -40,14 +43,14 @@ scenarios:
         expect:
           - event: bot_started_speaking
             within_ms: 40000     # counted from when the caller starts this line
-      - user: "Yes, that's all correct. I mean the nearest Wednesday."
+      - user: "Yes, that's all correct."
         expect:
           - event: function_call
             calls:
               - name: book_appointment
                 args: {time: "10:30", phone: "5550142237", name: "Sam Lee"}
 
-  # A number full of repeated digits, which speech-to-text tends to miscount.
+  # A number full of repeated digits, which speech-to-text miscounts: recovered by keypad entry.
   - name: repeated_digits
     turns:
       - expect:                     # let the greeting finish before the caller speaks
@@ -57,7 +60,13 @@ scenarios:
         expect:
           - event: bot_started_speaking
             within_ms: 40000     # counted from when the caller starts this line
-      - user: "Yes, that's all correct. I mean the nearest Tuesday."
+      # Speech-to-text drops a digit here every time ("741-333-333"). The bot should notice the wrong length
+      # and ask for the keypad; the caller types the number, which arrives exact.
+      - dtmf: "7413333333#"
+        expect:
+          - event: bot_started_speaking
+            within_ms: 20000
+      - user: "Yes, that's all correct."
         expect:
           - event: function_call
             calls:
@@ -74,7 +83,7 @@ scenarios:
         expect:
           - event: bot_started_speaking
             within_ms: 40000     # counted from when the caller starts this line
-      - user: "Yes, that's right. I mean the nearest Thursday."
+      - user: "Yes, that's right."
         expect:
           - event: function_call
             calls:

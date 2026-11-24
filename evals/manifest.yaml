@@ -15,4 +15,4 @@ spawn: "{python} {bot} --port {port}"
 suite:
   - bot: ../bot.py
     name: receptionist
-    scenarios: [receptionist]
+    scenarios: [receptionist, knowledge]

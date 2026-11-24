@@ -1,7 +1,8 @@
 # Voice receptionist
 
 A real-time voice agent that answers calls for a dental clinic: it listens, talks back, checks free
-times, books and reschedules appointments, and hangs up when the caller is done.
+times, books and reschedules appointments, answers questions about prices, insurance and visits from the
+clinic's own documents, and hangs up when the caller is done.
 
 It is built twice on purpose. `voice_loop.py` is the whole pipeline written by hand, so every stage and
 every millisecond is visible. `bot.py` is the same receptionist rebuilt on [Pipecat](https://github.com/pipecat-ai/pipecat),
@@ -9,7 +10,11 @@ with a browser client, tools and an automated eval suite. The contrast between t
 of the project: what a voice framework gives you, and what you still have to understand yourself.
 
 Everything runs locally except the LLM: speech-to-text is Whisper, the voice is Kokoro, voice detection is
-Silero, and the model is Claude Haiku 5.5.
+Silero, retrieval embeddings are BGE-small, and the model is Claude Haiku 5.5.
+
+**Latest results:** 36 of 36 simulated voice calls passed (12 scenarios, three runs each), and 210 of 210 replies
+passed the grounding test (21 cases, ten runs each). Details in [phase 7](#phase-7-clinic-knowledge-base) and
+[docs/eval-report.md](docs/eval-report.md).
 
 ## System design
 
@@ -25,12 +30,15 @@ flowchart TB
 
     subgraph pipeline["Pipeline (bot.py)"]
         stt["Speech-to-text<br/>Whisper base.en on GPU"]
+        keypad["Keypad entry<br/>DTMF digits"]
         turn["Turn detection<br/>Silero VAD + Smart Turn"]
+        notes["Clinic facts (rag.py)<br/>retrieval before the LLM"]
         llm["LLM<br/>Claude Haiku 5.5"]
         tts["Text-to-speech<br/>Kokoro on GPU"]
-        stt --> turn --> llm --> tts
+        stt --> keypad --> turn --> notes --> llm --> tts
     end
 
+    knowledge[("Clinic documents<br/>6 files, 29 sections")]
     tools["Booking tools (tools.py)<br/>check, book, reschedule, end call"]
     db[("Appointments<br/>SQLite")]
     calendar["External calendar<br/>planned"]:::planned
@@ -42,6 +50,7 @@ flowchart TB
     phone -.->|phone line| transport
     transport -->|audio in| stt
     tts -->|audio out| transport
+    knowledge -->|embedded at start-up| notes
     llm <-->|tool calls| tools
     tools --> db
     tools -.-> calendar
@@ -51,7 +60,8 @@ flowchart TB
     classDef planned stroke-dasharray: 5 5
 ```
 
-Editable copies of the diagrams are in [docs/](docs): `system-design.drawio` and `turn-sequence.drawio`.
+Editable copies of the diagrams are in [docs/](docs): `system-design.drawio` and `turn-sequence.drawio`. The
+draw.io copy of the system design shows the clinic facts but not keypad entry.
 
 ## One turn, with timings
 
@@ -98,6 +108,7 @@ Each phase is one or two commits, so the history reads in the same order as this
 | 4b | Phone line through Twilio | 1.9 to 3.5 s (simulated phone calls; the slower replies needed a tool call) |
 | 5 | Booking tools | Tool turns take two LLM round trips |
 | 6 | Automated voice evals | p50 3.5 s, p95 4.6 s with the harness sharing the machine |
+| 7 | Clinic knowledge base, keypad entry for phone numbers | p50 3.5 s, p95 4.9 s in the eval run; retrieval adds 17 to 37 ms a turn |
 
 "Simulated" means synthetic caller audio fed through the real pipeline with playback muted. "Live" means a
 person talking into a microphone.
@@ -270,8 +281,8 @@ First full run: **17 of 21 calls passed.** The full report is in [docs/eval-repo
 
 - **Repeated digits is a real bug.** Speech-to-text heard "741 333 3333" as "741-333-333" every time. A larger
   Whisper model was tested and did not help: both models got 7 of 8 spoken numbers right offline, and the larger
-  one was about three times slower. The scenario stays in the suite as a known failure. On a real phone line the
-  fix is caller ID or keypad entry, not a bigger model.
+  one was about three times slower. The fix had to come from outside speech recognition: caller ID on a phone
+  line, and keypad entry when a number comes out the wrong length ([phase 7](#phase-7-clinic-knowledge-base)).
 - **The weekend failure was a flaw in the check,** which read a silent tool call as an empty reply. With the
   check fixed, that scenario passed 3 of 3 in a separate rerun.
 - **The evals changed the bot.** They showed it asking for confirmation twice before booking; it now confirms
@@ -281,6 +292,97 @@ Reply latency in the eval run was p50 3.5 s and p95 4.6 s over 16 replies. That 
 because most of those replies needed a tool call and the harness shares the machine's CPU and GPU with the bot.
 LLM cost came to about $0.001 per minute of call at Haiku 5.5 list price; speech-to-text and the voice run
 locally.
+
+### Phase 7: clinic knowledge base
+
+The receptionist answers questions about prices, insurance, opening hours, parking, first visits,
+cancellations and emergencies from six documents in [knowledge/](knowledge), and says so when they do not cover
+something.
+
+```mermaid
+flowchart LR
+    docs[("knowledge/*.md<br/>6 documents")] -->|"one chunk per section,<br/>embedded at start-up"| index["Index<br/>29 chunks, BGE-small on CPU"]
+    turn["Caller's turn<br/>every fragment"] --> judge{"Is any fragment<br/>a clinic question?"}
+    judge -->|no| none["No facts"]
+    judge -->|yes| search["Search the whole turn<br/>top 5, within 0.10 of the best"]
+    index --> search
+    search --> block["One clinic_facts block<br/>after the turn"]
+    block --> llm["Claude Haiku 5.5"]
+```
+
+- **Retrieval runs inside the pipeline, before the LLM** (`ClinicNotes` in `bot.py`), so answering from the
+  documents costs no extra LLM round trip: 17 to 37 ms a turn.
+- **It searches the whole caller turn.** Speech arrives in fragments, and the question is not always the last
+  one. The facts go in a single block after the turn, and facts already given earlier in the call are not sent
+  again.
+- **Booking and small talk get no facts.** Each fragment is compared with examples of booking requests, names,
+  numbers and yes or no; facts are fetched only if some fragment reads as a clinic question.
+- **The prompt treats the facts as the receptionist's own knowledge.** Anything they do not mention is unknown,
+  not a no, and the answer is "I'm not sure about that" with an offer of a call back. No guessed prices, no
+  medical advice.
+- **Phone numbers must have 10 digits.** The booking tools refuse any other length, and the bot then asks the
+  caller to type the number on their keypad, which arrives as exact digits.
+
+Retrieval, measured on 49 questions written the way a caller would say them and 20 turns that need no facts
+(`python rag.py --eval`):
+
+| Measure | Result |
+|---|---|
+| Right section ranked first | 40 of 49 (82%) |
+| Right section among the facts sent to the LLM | 49 of 49, 3 chunks on average |
+| The same with the question first, in the middle or last of a fragmented turn | 49 of 49 each |
+| No facts for turns that need none | 14 of 20, against 6 of 20 without the booking check |
+| Keyword search (BM25) instead of embeddings, right section first | 16 of 34, against 30 of 34 (first 34 questions) |
+
+#### What the debugging found
+
+The first version passed its first tests. A deeper round of debugging, reading the actual requests the bot sent
+to Claude and running every case many times, found these:
+
+| Problem | How it showed up | Fix |
+|---|---|---|
+| Only the last fragment of a turn was searched | A question followed by "Thanks." got the right facts 0 times in 44 | Search the whole turn |
+| Facts attached after each fragment split the caller's words | A phone number reached Claude as "555." [facts] "014" [facts] "2-2-3-7.", and the bot called it incomplete | One block after the whole turn |
+| The bot told callers what "the clinic notes say" | Several replies; renaming the notes to "facts" made it worse ("the facts I have…", 4 times in 10) | Facts inside tags, and a set phrase for gaps |
+| Invented negatives | "We don't sell electric toothbrushes", with nothing in the documents either way | Unmentioned means unknown, not no |
+| An ambiguous document | Asked about Medicare: "no" 3 times, "I don't know" twice, because the insurance list never said it was complete | The document now says it is the complete list |
+| False claims of a booking | "Sorry, I booked the wrong day" when only a time had been checked | Claim a booking only after the tool succeeded |
+| Irrelevant facts on booking turns | Most booking turns got lateness and emergency facts | The booking check above: 6 of 60 booking-call turns still get some |
+| Repeated digits misheard | Every repeated-digits call booked under a 9-digit number | The 10-digit rule and keypad entry |
+
+The tests had flaws too, and those were fixed rather than the bot tuned to them: patterns that failed correct
+answers ("whether we sell" read as a claim), a scenario where the caller said yes and corrected the date in
+one breath, and a cancelled, empty reply scored as the bot's answer.
+
+#### Grounding test
+
+`evals/grounding.py` builds each request exactly as the bot does (its prompt, retrieval and real tools, on an
+empty appointment book) and runs every case ten times, because one run of a language model is an anecdote. Its
+21 cases cover prices, refusals, questions the documents do not answer, medical advice, an attempt to make the
+bot ignore its facts, fragmented turns, false booking claims and keypad entry. Every reply is also checked for
+mentioning notes or tags and for claiming a booking no tool made. Result: **210 of 210**.
+
+#### Latest voice suite
+
+| Scenario | Passed | What it checks |
+|---|---|---|
+| Greeting | 3 of 3 | The bot speaks first and names the clinic |
+| Book appointment | 3 of 3 | The right time, phone number and name reach the booking |
+| Repeated digits | 3 of 3 | A misheard number is recovered by keypad entry |
+| Reschedule | 3 of 3 | Books, then moves the appointment |
+| Weekend refused | 3 of 3 | Says the clinic is closed on Saturday |
+| Interruption | 3 of 3 | Stops talking within 1.5 s of the caller cutting in |
+| Wrong number | 3 of 3 | Says goodbye and hangs up |
+| Price from the documents | 3 of 3 | Quotes the cleaning price exactly |
+| Insurance not accepted | 3 of 3 | Says Aetna is not accepted |
+| Parking, reworded | 3 of 3 | Answers "anywhere to leave my car" from the parking section |
+| Not in the documents | 3 of 3 | Admits it does not know, quotes no price |
+| No medical advice | 3 of 3 | Names no medicine, points to a dentist |
+
+Reply latency was p50 3.5 s and p95 4.9 s over 16 replies, with stage medians of 396 ms for speech-to-text,
+557 ms to the LLM's first token and 820 ms to the voice's first audio. Between runs of the suite the p50 has
+moved between 2.9 and 3.5 s: with 16 to 18 timed replies a run, it mostly reflects how many of them needed a
+tool call. LLM cost was $0.0007 a call, or $0.0015 a minute of call.
 
 ## Run it
 
@@ -299,6 +401,15 @@ Check the pieces without a microphone. The first run downloads the Whisper model
 ```powershell
 .\.venv\Scripts\python voice_loop.py --check
 .\.venv\Scripts\python tools.py --check
+.\.venv\Scripts\python rag.py --check
+.\.venv\Scripts\python evals\test_clinic_notes.py
+```
+
+Measure retrieval, and see what a question would retrieve:
+
+```powershell
+.\.venv\Scripts\python rag.py --eval
+.\.venv\Scripts\python rag.py "do you take cigna"
 ```
 
 Talk to the hand-built loop. Use a headset; it has no echo cancellation:
@@ -323,10 +434,12 @@ $env:TWILIO_AUTH_TOKEN = "your-auth-token"
 .\.venv\Scripts\python bot.py -t twilio -x your-tunnel-host
 ```
 
-Run the evals and write the report:
+Run the evals and write the report. The grounding test calls Claude directly and takes a few minutes; the voice
+suite starts a fresh bot for every call and takes about 17 minutes:
 
 ```powershell
 $env:APPOINTMENTS_DB = "fresh"
+.\.venv\Scripts\python evals\grounding.py 10
 .\.venv\Scripts\python -m pipecat.evals suite evals\manifest.yaml --repeat 3
 .\.venv\Scripts\python evals\report.py
 ```
@@ -338,7 +451,9 @@ $env:APPOINTMENTS_DB = "fresh"
 | `voice_loop.py` | The pipeline by hand: VAD, endpointing, speech-to-text, LLM streaming, voice, interruptions |
 | `bot.py` | The same receptionist on Pipecat, with a browser client |
 | `tools.py` | The appointment book and the tools the LLM can call |
-| `evals/` | Scripted voice scenarios, the suite manifest, the report script and a Twilio call simulator |
+| `rag.py` | Retrieval: chunking, embeddings, the booking check, and attaching facts to a caller's turn |
+| `knowledge/` | The clinic's documents |
+| `evals/` | Voice scenarios and manifest, the grounding test, labelled retrieval questions, a test of the facts processor, the report script and a Twilio call simulator |
 | `eval_services.py` | The simulated caller's voice for the eval harness |
 | `docs/` | The eval report and the editable diagrams |
 
@@ -352,3 +467,9 @@ $env:APPOINTMENTS_DB = "fresh"
 - **History is trimmed to whole sentences** after an interruption, not to the exact word.
 - **Short words and names are sometimes misheard** by the small speech model, which is why the bot reads the
   name and number back before booking.
+- **The knowledge base is small and fictional:** six documents written for this project. The approach suits
+  that size; it has not been tested on hundreds of documents.
+- **The booking check has a thin margin.** "Are you open on Saturdays" keeps its facts by 0.04, and 6 of 60
+  booking-call turns still get facts they do not need, which costs tokens but not accuracy.
+- **Phone numbers are assumed to be US numbers** of 10 digits.
+- **Keypad entry is tested through the eval harness only,** not yet in a live browser or phone call.

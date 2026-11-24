@@ -25,8 +25,11 @@ import onnxruntime as ort
 from loguru import logger
 
 # Importing voice_loop also puts the NVIDIA DLLs on PATH, which Whisper needs here too.
+import rag
 from tools import TOOLS
 from voice_loop import MODEL, MODELS_DIR, VOICE
+
+KNOWLEDGE = rag.Index()  # the clinic's documents, embedded once when the server starts
 
 SYSTEM = (
     "You are the receptionist at Bright Smile Dental, answering a phone call. Your words are spoken aloud, so "
@@ -38,7 +41,22 @@ SYSTEM = (
     "To book you need the caller's name, phone number, the reason for the visit and a time. Speech recognition "
     "mishears names and numbers, so before booking read the name, number, day and time back in one sentence "
     "and ask once whether that is right. Book as soon as the caller says yes; do not ask a second time. "
+    "Phone numbers here have 10 digits. If the number you heard does not have exactly 10, do not read it back: "
+    "ask the caller to type it on their phone keypad and press the pound key. Keypad entries reach you as "
+    "'DTMF:' followed by the digits, and they are exact. "
+    "Say an appointment is booked, moved or cancelled only after the tool that does it has succeeded; if you "
+    "have only checked a time, say that you checked it. "
     "If a tool reports a problem, tell the caller plainly and suggest an alternative. "
+    "Callers also ask about prices, insurance, opening hours, parking, first visits, cancellations and "
+    "emergencies. Facts about the clinic arrive inside <clinic_facts> tags after the caller's words. They are "
+    "your own knowledge as the receptionist: answer from them, and never mention the tags, notes, documents or "
+    "where a fact came from. The facts only cover the topics they mention: a list of what the clinic offers or "
+    "accepts settles questions about that kind of thing only, and anything the facts do not mention is unknown, "
+    "not a no. When the facts do not cover a question, do not say whether the clinic does or does not do it, and "
+    "do not explain why you cannot answer: say \"I'm not sure about that\" and offer to have someone call back. "
+    "Never guess a price or a policy. "
+    "Never give medical advice or say which symptoms matter: for pain or swelling, offer an emergency "
+    "appointment, and repeat only the emergency guidance the facts give. "
     "When the caller has nothing more to ask, call end_call with your goodbye; it says it and hangs up. "
     "Today is {today:%A} {today.day} {today:%B} {today.year}."
 )
@@ -52,11 +70,13 @@ ort.set_default_logger_severity(3)  # errors only
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.evals.transport import EvalTransportParams
 from pipecat.audio.vad.vad_analyzer import VADParams, VADState
-from pipecat.frames.frames import LLMRunFrame
+from pipecat.frames.frames import LLMContextFrame, LLMRunFrame
 from pipecat.observers.user_bot_latency_observer import UserBotLatencyObserver
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.worker import PipelineParams, PipelineWorker
+from pipecat.processors.aggregators.dtmf_aggregator import DTMFAggregator
 from pipecat.processors.aggregators.llm_context import LLMContext
+from pipecat.processors.frame_processor import FrameProcessor
 from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair, LLMUserAggregatorParams
 from pipecat.runner.types import RunnerArguments
 from pipecat.runner.utils import create_transport
@@ -96,6 +116,28 @@ class LoudnessLoggingVAD(SileroVADAnalyzer):
             logger.info(f"speech ended, loudness peak {self._peak:.2f} (MIN_VOLUME {MIN_VOLUME})")
             self._peak = None
         return state
+
+
+class ClinicNotes(FrameProcessor):
+    """Retrieval. When the caller's turn is on its way to the LLM, attach the clinic notes that match it.
+
+    The lookup happens before the LLM is called, so answering from the notes costs one embedding (about
+    10 ms) and no extra LLM round trip. Only the caller's current turn is ever changed: its notes block is
+    kept after its last fragment. Everything before the bot's last reply stays exactly as it was.
+    """
+
+    async def process_frame(self, frame, direction):
+        await super().process_frame(frame, direction)
+        # A speculative inference (eager end of turn, off by default) runs on a copy of the conversation that
+        # Pipecat builds for it, so the facts are attached to that copy and the real history is untouched.
+        if isinstance(frame, LLMContextFrame):
+            query, found, messages = rag.notes_for_turn(KNOWLEDGE, frame.context.messages)
+            if messages is not None:
+                frame.context.set_messages(messages)  # changes only the caller's current turn
+            if query:
+                hits = ", ".join(f"{c['section']} ({s:.2f})" for s, c in found) or "nothing"
+                logger.info(f"retrieved for {query[-60:]!r}: {hits}")
+        await self.push_frame(frame, direction)
 
 
 async def caller_number(call):
@@ -166,7 +208,9 @@ async def bot(runner_args: RunnerArguments):
     pipeline = Pipeline([
         transport.input(),     # caller audio in
         stt,
+        DTMFAggregator(),      # keypad presses become a "DTMF: 7413333333#" transcription
         user_aggregator,       # decides when the caller's turn is over
+        ClinicNotes(),         # attaches matching clinic notes to the caller's turn
         llm,
         tts,
         transport.output(),    # bot audio out
