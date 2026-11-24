@@ -1,0 +1,46 @@
+# The cloud voice failing. Start the bot with an ElevenLabs key that will be refused, then run this:
+#
+#   $env:TTS = "elevenlabs"; $env:ELEVENLABS_API_KEY = "not-a-real-key"
+#   .\.venv\Scripts\python bot.py
+#   .\.venv\Scripts\python -m pipecat.evals run evals\failover.yaml
+#
+# ElevenLabs refuses the key, Pipecat gives up on it after three tries, and Kokoro takes over. The caller must
+# still hear the greeting (it was lost with ElevenLabs and is asked for again), and questions after it are answered
+# in the local voice.
+# Kept out of scenarios/, which the suite runs against the default local voice.
+
+name: failover
+
+user:
+  modality: audio
+  speech:
+    factory: eval_services.caller_voice
+    voice: am_michael
+
+judge:
+  modality: audio          # the bot speaks, so reply timings include voice synthesis
+  transcription:
+    service: whisper
+    model: tiny.en      # only so the bot speaks; no check reads this transcript, so keep it light
+
+scenarios:
+  # The greeting still arrives, in the local voice.
+  - name: greeting
+    turns:
+      - expect:
+          - event: bot_started_speaking
+            within_ms: 20000
+          - event: llm_response
+            text_contains: "Bright Smile"
+            check_from: turn_start
+
+  # After the failover: a question is answered, in the local voice.
+  - name: question_after_failover
+    turns:
+      - expect:
+          - event: bot_stopped_speaking
+            within_ms: 30000
+      - user: "How much does a routine cleaning cost?"
+        expect:
+          - event: llm_response
+            text_matches: ['95|[Nn]inety.five']

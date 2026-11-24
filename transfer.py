@@ -198,8 +198,9 @@ class Desk:
         track = rtc.LocalAudioTrack.create_audio_track("briefing", source)
         await self.room.local_participant.publish_track(track, rtc.TrackPublishOptions(
             source=rtc.TrackSource.SOURCE_MICROPHONE))
-        # ponytail: reuses the TTS service's private Kokoro model rather than loading a second copy
-        samples, rate = await asyncio.to_thread(self.kokoro.create, text, voice=self.voice, speed=1.0, lang="en-us")
+        # self.kokoro loads the model; bot.py shares one copy per process, so a Kokoro call does not load a second
+        samples, rate = await asyncio.to_thread(lambda: self.kokoro().create(text, voice=self.voice, speed=1.0,
+                                                                             lang="en-us"))
         if rate != RATE:
             samples = np.interp(np.arange(0, len(samples), rate / RATE), np.arange(len(samples)), samples)
         pcm = (np.clip(samples, -1, 1) * 32767).astype(np.int16)

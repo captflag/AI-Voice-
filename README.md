@@ -10,7 +10,8 @@ with a browser client, tools and an automated eval suite. The contrast between t
 of the project: what a voice framework gives you, and what you still have to understand yourself.
 
 Everything runs locally except the LLM: speech-to-text is Whisper, the voice is Kokoro, voice detection is
-Silero, retrieval embeddings are BGE-small, and the model is Claude Haiku 5.5.
+Silero, retrieval embeddings are BGE-small, and the model is Claude Haiku 5.5. The voice can be switched to
+ElevenLabs, with Kokoro taking over if it fails.
 
 **Latest results:** 38 of 39 simulated voice calls passed (13 scenarios, three runs each; the miss was a test
 artefact, fixed and rerun 5 of 5), 250 of 250 replies passed the grounding test (25 cases, ten runs each), and
@@ -37,7 +38,7 @@ flowchart TB
         turn["Turn detection<br/>Silero VAD + Smart Turn"]
         notes["Clinic facts (rag.py)<br/>retrieval before the LLM"]
         llm["LLM<br/>Claude Haiku 5.5"]
-        tts["Text-to-speech<br/>Kokoro on GPU"]
+        tts["Text-to-speech<br/>Kokoro on GPU, or ElevenLabs with Kokoro as fallback"]
         stt --> keypad --> turn --> notes --> llm --> tts
     end
 
@@ -119,7 +120,7 @@ Each phase is one or two commits, so the history reads in the same order as this
 | 5 | Booking tools | Tool turns take two LLM round trips |
 | 6 | Automated voice evals | p50 3.5 s, p95 4.6 s with the harness sharing the machine |
 | 7 | Clinic knowledge base, keypad entry for phone numbers | p50 3.5 s, p95 4.9 s in the eval run; retrieval adds 17 to 37 ms a turn |
-| 8 (in progress) | LiveKit rooms, a warm transfer to a person at the front desk, OpenTelemetry traces | 1.6 to 2.2 s on scripted LiveKit calls |
+| 8 (in progress) | LiveKit rooms, a warm transfer to a person at the front desk, OpenTelemetry traces, a switchable cloud voice | 1.6 to 2.2 s on scripted LiveKit calls |
 
 "Simulated" means synthetic caller audio fed through the real pipeline with playback muted. "Live" means a
 person talking into a microphone.
@@ -543,6 +544,24 @@ and the voice suite, which calls every tool, passed **13 of 13**.
 | The 30 s answer timer starts after the spoken briefing ends, not when it starts, as the code comment said | The comment now says so |
 | An earlier, half-finished test run's spans arrived during the next run: the exporter retries spans a backend missed | The check picks calls by their start time |
 
+**Step 4, a cloud voice (built; not yet tried with a real key).** Setting `TTS=elevenlabs` swaps Kokoro for
+ElevenLabs' Flash v2.5 model, its lowest-latency one, streamed over a websocket; `ELEVENLABS_VOICE_ID` picks the
+voice. Speech-to-text stays on the local Whisper. The private transfer briefing is always read by Kokoro, so
+transfers work whichever voice the caller hears.
+
+No ElevenLabs key was available, so the cloud voice itself has not spoken yet, and the latency and cost against
+Kokoro are still to be measured. What could be tested without one is what a caller gets when the cloud voice
+fails, and that found the worst outcome a phone line can have:
+
+| Problem | Fix |
+|---|---|
+| With a key ElevenLabs refuses, Pipecat tried three times, marked the voice unusable and kept the call open in silence: the caller heard nothing at all | Kokoro stands behind ElevenLabs in Pipecat's `ServiceSwitcher` with its failover strategy, so whatever ElevenLabs cannot say (a bad key, an outage, no credit left) is said in the local voice |
+| The greeting was still lost: it had already gone to ElevenLabs when it failed, so the caller heard silence until they spoke | When the voice switches and none of the current reply was spoken, the LLM is asked for it again. The greeting now arrives about 3 s late, once, in Kokoro's voice |
+
+`evals/failover.yaml` runs this with a fake key: the greeting and a question after it both passed, as did two
+transfer calls (10 of 10 checks). On the default voice the full transfer test passed 19 of 19 and the voice suite
+13 of 13.
+
 ## Run it
 
 Tested on Windows 10 with Python 3.13, an Intel i5-10400F and a GTX 1660 (6 GB). An NVIDIA GPU is optional but
@@ -613,6 +632,16 @@ transfer test (close the staff page first, since it counts as someone at the des
 .\.venv\Scripts\python evals\transfer_call.py
 ```
 
+Use the ElevenLabs voice. Add your key as a user environment variable once, then start the bot with the switch
+set. To check the fallback to Kokoro, use a fake key and run the failover scenarios:
+
+```powershell
+[Environment]::SetEnvironmentVariable("ELEVENLABS_API_KEY", "your-key", "User")
+$env:TTS = "elevenlabs"; $env:ELEVENLABS_API_KEY = [Environment]::GetEnvironmentVariable("ELEVENLABS_API_KEY", "User")
+.\.venv\Scripts\python bot.py
+.\.venv\Scripts\python -m pipecat.evals run evals\failover.yaml
+```
+
 See the calls as traces. Download Jaeger for your platform from
 [its releases](https://github.com/jaegertracing/jaeger/releases) into `bin\jaeger\`, start it, start the bot
 with the endpoint set, make calls, and open http://localhost:16686. To run the trace check instead, stop Jaeger
@@ -647,7 +676,7 @@ $env:APPOINTMENTS_DB = "fresh"
 | `telemetry.py` | OpenTelemetry: sends Pipecat's spans to a backend, and adds spans for tool calls and transfers |
 | `rag.py` | Retrieval: chunking, embeddings, the booking check, and attaching facts to a caller's turn |
 | `knowledge/` | The clinic's documents |
-| `evals/` | Voice scenarios and manifest, the grounding test, labelled retrieval questions, a test of the facts processor, the report script, a Twilio call simulator, a scripted LiveKit caller, the transfer test, the trace check and a check of how Whisper hears the clinic's names |
+| `evals/` | Voice scenarios and manifest, the grounding test, labelled retrieval questions, a test of the facts processor, the report script, a Twilio call simulator, a scripted LiveKit caller, the transfer test, the trace check, the voice failover scenarios and a check of how Whisper hears the clinic's names |
 | `eval_services.py` | The simulated caller's voice for the eval harness |
 | `docs/` | The eval report, the editable diagrams and a Jaeger screenshot |
 
@@ -670,6 +699,9 @@ $env:APPOINTMENTS_DB = "fresh"
 - **LiveKit is tested with a scripted caller on a local server,** not yet with a person on a microphone or a
   hosted LiveKit server.
 - **Aetna is still misheard** in one voice of three, even with hotwords.
+- **The ElevenLabs voice has not spoken yet:** it is built and its failure path is tested, but without a key
+  its latency, cost and sound are unmeasured. When it fails, every new call tries it again first, so each one
+  starts about 3 s late until the key or the service is fixed.
 - **Transfers need LiveKit.** On the browser client and the Twilio line the bot can only take a message.
 - **A caller on hold cannot change their mind:** their words are dropped until staff answer or the bot comes
   back, so "never mind" is not heard.

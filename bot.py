@@ -20,6 +20,7 @@ appointments, and hang up when the caller is done. Phase 8 adds LiveKit, transfe
 import functools
 import os
 from datetime import date
+from pathlib import Path
 
 import aiohttp
 import ctranslate2
@@ -83,6 +84,7 @@ from pipecat.audio.vad.vad_analyzer import VADParams, VADState
 from pipecat.frames.frames import LLMContextFrame, LLMRunFrame
 from pipecat.observers.user_bot_latency_observer import UserBotLatencyObserver
 from pipecat.pipeline.pipeline import Pipeline
+from pipecat.pipeline.service_switcher import ServiceSwitcher, ServiceSwitcherStrategyFailover
 from pipecat.pipeline.worker import PipelineParams, PipelineWorker
 from pipecat.processors.aggregators.dtmf_aggregator import DTMFAggregator
 from pipecat.processors.aggregators.llm_context import LLMContext
@@ -93,6 +95,7 @@ from pipecat.runner.utils import create_transport
 from pipecat.services.anthropic.llm import AnthropicLLMService
 import pipecat.services.kokoro.tts as kokoro_tts
 import pipecat.services.whisper.stt as whisper_stt
+from pipecat.services.elevenlabs.tts import ElevenLabsTTSService
 from pipecat.services.kokoro.tts import KokoroTTSService
 from pipecat.services.whisper.stt import WhisperSTTService
 
@@ -123,6 +126,18 @@ from pipecat.workers.runner import WorkerRunner
 # Tried and removed: requiring three recognised words before a turn could start (MinWordsUserTurnStartStrategy).
 # It made a turn start only once its transcript arrived, which added a fixed 0.8 s wait to every reply.
 MIN_VOLUME = 0.72
+
+
+# The bot's voice: "kokoro", local and free, or "elevenlabs", a cloud voice that needs ELEVENLABS_API_KEY.
+# Speech-to-text stays local either way. Set as an environment variable, so the eval suite can switch it too.
+TTS = os.getenv("TTS", "kokoro")
+if TTS not in ("kokoro", "elevenlabs"):
+    raise SystemExit(f"TTS must be kokoro or elevenlabs, not {TTS!r}")
+if TTS == "elevenlabs" and not os.getenv("ELEVENLABS_API_KEY"):
+    raise SystemExit("TTS=elevenlabs needs ELEVENLABS_API_KEY")
+SARAH = "EXAVITQu4vr4xnSDxMaL"  # an ElevenLabs default voice, close to Kokoro's af_sarah; ELEVENLABS_VOICE_ID overrides it
+# Paths written the way Pipecat writes them, so the shared Kokoro (see above) is one model for calls and briefings.
+KOKORO_FILES = (str(Path(MODELS_DIR, "kokoro-v1.0.onnx")), str(Path(MODELS_DIR, "voices-v1.0.bin")))
 
 
 HOTWORDS = "Bright Smile Dental, Cigna, Delta Dental, MetLife, Aetna, Medicare, Apple Pay, Riverside Orthodontics"
@@ -227,11 +242,16 @@ async def bot(runner_args: RunnerArguments):
         api_key=os.environ["ANTHROPIC_API_KEY"],
         settings=AnthropicLLMService.Settings(model=MODEL, system_instruction=system),
     )
-    tts = KokoroTTSService(
-        model_path=os.path.join(MODELS_DIR, "kokoro-v1.0.onnx"),
-        voices_path=os.path.join(MODELS_DIR, "voices-v1.0.bin"),
-        settings=KokoroTTSService.Settings(voice=VOICE),
-    )
+    tts = KokoroTTSService(model_path=KOKORO_FILES[0], voices_path=KOKORO_FILES[1],
+                           settings=KokoroTTSService.Settings(voice=VOICE))
+    if TTS == "elevenlabs":
+        # Flash v2.5 by default, ElevenLabs' lowest-latency model. It streams over one websocket per call.
+        cloud = ElevenLabsTTSService(api_key=os.environ["ELEVENLABS_API_KEY"],
+                                     settings=ElevenLabsTTSService.Settings(voice=os.getenv("ELEVENLABS_VOICE_ID", SARAH)))
+        # Kokoro stands behind it. With a bad key, Pipecat gave up on ElevenLabs after three refused connections and
+        # the call went on in silence; now whatever ElevenLabs cannot say (a bad key, an outage, no credit) is
+        # said in the local voice instead.
+        tts = ServiceSwitcher(services=[cloud, tts], strategy_type=ServiceSwitcherStrategyFailover)
 
     # The conversation history, and the two processors that write the caller's and the bot's turns into it.
     # Pipecat reads each tool's signature and docstring and registers it; each call is also a span.
@@ -270,6 +290,17 @@ async def bot(runner_args: RunnerArguments):
         for line in breakdown.turn_contribution_lines():
             logger.info(f"    {line}")
 
+    if TTS == "elevenlabs":
+        @tts.strategy.event_handler("on_service_switched")
+        async def on_voice_switched(strategy, service):
+            # The reply ElevenLabs had when it failed is lost: with a bad key that was the greeting, and the caller
+            # heard nothing until they spoke. The context only keeps what was actually spoken, so if none of this
+            # reply was, it is asked for again and said in the local voice.
+            logger.warning(f"the cloud voice failed, carrying on with {service.name}")
+            last = context.messages[-1] if context.messages else {}
+            if not (isinstance(last, dict) and last.get("role") == "assistant"):
+                await worker.queue_frames([LLMRunFrame()])
+
     greeted = False
 
     async def greet(*_):
@@ -287,7 +318,9 @@ async def bot(runner_args: RunnerArguments):
 
     desk = None
     if isinstance(runner_args, LiveKitRunnerArguments):  # only a LiveKit room can take a second person
-        desk = transfer.Desk(runner_args.url, runner_args.room_name, gate, worker, context, tts._kokoro, VOICE)
+        # The private briefing is always read by Kokoro, loaded on the first transfer if the call uses ElevenLabs.
+        desk = transfer.Desk(runner_args.url, runner_args.room_name, gate, worker, context,
+                             functools.partial(kokoro_tts.Kokoro, *KOKORO_FILES), VOICE)
         llm.desk = desk  # transfer_to_staff in tools.py finds it here
 
         @transport.event_handler("on_participant_connected")
