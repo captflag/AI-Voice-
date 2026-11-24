@@ -13,11 +13,12 @@ Everything runs locally except the LLM: speech-to-text is Whisper, the voice is 
 Silero, retrieval embeddings are BGE-small, and the model is Claude Haiku 5.5. The voice can be switched to
 ElevenLabs, with Kokoro taking over if it fails.
 
-**Latest results:** 38 of 39 simulated voice calls passed (13 scenarios, three runs each; the miss was a test
-artefact, fixed and rerun 5 of 5), 250 of 250 replies passed the grounding test (25 cases, ten runs each), and
-19 of 19 checks passed in each round of the warm-transfer test on LiveKit. Details in
-[phase 7](#phase-7-clinic-knowledge-base), [phase 8](#phase-8-handing-a-call-to-a-person-in-progress) and
-[docs/eval-report.md](docs/eval-report.md).
+**Latest results:** 13 of 13 simulated voice calls passed in the latest run of the suite, after phase 8's
+changes, with replies at p50 2.5 s ([docs/eval-report.md](docs/eval-report.md)); the last three-run suite
+passed 38 of 39 (the miss was a test artefact, fixed and rerun 5 of 5). 250 of 250 replies passed the
+grounding test (25 cases, ten runs each), and 19 of 19 checks passed in each round of the warm-transfer test on
+LiveKit. Details in [phase 7](#phase-7-clinic-knowledge-base) and
+[phase 8](#phase-8-handing-a-call-to-a-person-in-progress).
 
 ## System design
 
@@ -71,8 +72,9 @@ flowchart TB
     classDef planned stroke-dasharray: 5 5
 ```
 
-Editable copies of the diagrams are in [docs/](docs): `system-design.drawio` and `turn-sequence.drawio`. The
-draw.io copy of the system design shows the clinic facts but not keypad entry.
+Editable draw.io diagrams are in [docs/](docs). `system-design.drawio` has a page for all phases combined, with
+each box tagged by the phase that added it, then one page per phase (1 to 8, including 4b);
+`turn-sequence.drawio` is the turn diagram below.
 
 ## One turn, with timings
 

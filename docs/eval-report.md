@@ -1,26 +1,26 @@
-# Eval report: 20261124_142833
+# Eval report: 20261124_181953
 
-39 simulated calls by voice against `bot.py`, each on a freshly started bot with an empty appointment book.
+13 simulated calls by voice against `bot.py`, each on a freshly started bot with an empty appointment book.
 
 ## Task success
 
-**38 of 39 calls passed (97%).**
+**13 of 13 calls passed (100%).**
 
 | Scenario | Passed | First failure |
 |---|---|---|
-| greeting | 3 of 3 |  |
-| book_appointment | 3 of 3 |  |
-| repeated_digits | 3 of 3 |  |
-| reschedule | 3 of 3 |  |
-| weekend_refused | 3 of 3 |  |
-| interruption | 3 of 3 |  |
-| wrong_number | 3 of 3 |  |
-| message_when_nobody_free | 3 of 3 |  |
-| price_from_notes | 3 of 3 |  |
-| insurance_not_accepted | 3 of 3 |  |
-| parking | 3 of 3 |  |
-| not_in_notes | 3 of 3 |  |
-| no_medical_advice | 2 of 3 | text '' does not match '(?i)emergency/can.t (give/recommend/advise)/cannot (give/recommend/advise)/not able to/medical advice/dentist' |
+| greeting | 1 of 1 |  |
+| book_appointment | 1 of 1 |  |
+| repeated_digits | 1 of 1 |  |
+| reschedule | 1 of 1 |  |
+| weekend_refused | 1 of 1 |  |
+| interruption | 1 of 1 |  |
+| wrong_number | 1 of 1 |  |
+| message_when_nobody_free | 1 of 1 |  |
+| price_from_notes | 1 of 1 |  |
+| insurance_not_accepted | 1 of 1 |  |
+| parking | 1 of 1 |  |
+| not_in_notes | 1 of 1 |  |
+| no_medical_advice | 1 of 1 |  |
 
 ## Reply latency
 
@@ -28,15 +28,15 @@ From the caller's last word to the bot's first, as measured by the bot itself. T
 
 | Replies | p50 | p95 | Slowest |
 |---|---|---|---|
-| 20 | 2652 ms | 3806 ms | 3812 ms |
+| 7 | 2519 ms | 4857 ms | 4857 ms |
 
 | Stage | Samples | Median | p95 |
 |---|---|---|---|
-| Speech-to-text, per segment | 99 | 386 ms | 635 ms |
-| LLM, time to first token | 143 | 581 ms | 797 ms |
-| Voice, time to first audio | 65 | 826 ms | 882 ms |
+| Speech-to-text, per segment | 33 | 396 ms | 634 ms |
+| LLM, time to first token | 48 | 560 ms | 645 ms |
+| Voice, time to first audio | 22 | 858 ms | 1049 ms |
 
 ## LLM cost
 
-287,787 input and 10,874 output tokens across all calls, about $0.0342 in total at Haiku 5.5 list price.
+97,231 input and 3,707 output tokens across all calls, about $0.0116 in total at Haiku 5.5 list price.
 That is $0.0009 per call, or $0.0018 per minute of call. Speech-to-text and the voice run locally, so they add hardware cost but no per-minute fee.
