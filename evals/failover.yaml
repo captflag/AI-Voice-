@@ -6,7 +6,9 @@
 #
 # ElevenLabs refuses the key, Pipecat gives up on it after three tries, and Kokoro takes over. The caller must
 # still hear the greeting (it was lost with ElevenLabs and is asked for again), and questions after it are answered
-# in the local voice.
+# in the local voice. The calls after the first must not wait on ElevenLabs again: the bot skips it for
+# CLOUD_VOICE_RETRY_AFTER seconds (300 by default) once it has failed, so their greeting starts at once. The
+# scenarios run in order on one bot, so the first call is the one that pays for the failure.
 # Kept out of scenarios/, which the suite runs against the default local voice.
 
 name: failover
@@ -44,3 +46,11 @@ scenarios:
         expect:
           - event: llm_response
             text_matches: ['95|[Nn]inety.five']
+
+  # A later call goes straight to the local voice. A call that first waits on ElevenLabs started speaking about
+  # 4.5 s after it was set up, one that skips it 0.9 s after.
+  - name: later_call_skips_the_cloud_voice
+    turns:
+      - expect:
+          - event: bot_started_speaking
+            within_ms: 2500

@@ -19,6 +19,7 @@ appointments, and hang up when the caller is done. Phase 8 adds LiveKit, transfe
 """
 import functools
 import os
+import time
 from datetime import date
 from pathlib import Path
 
@@ -138,6 +139,11 @@ if TTS == "elevenlabs" and not os.getenv("ELEVENLABS_API_KEY"):
 SARAH = "EXAVITQu4vr4xnSDxMaL"  # an ElevenLabs default voice, close to Kokoro's af_sarah; ELEVENLABS_VOICE_ID overrides it
 # Paths written the way Pipecat writes them, so the shared Kokoro (see above) is one model for calls and briefings.
 KOKORO_FILES = (str(Path(MODELS_DIR, "kokoro-v1.0.onnx")), str(Path(MODELS_DIR, "voices-v1.0.bin")))
+# Once ElevenLabs has failed, new calls skip it for this many seconds, then the next call tries it again. Each
+# failure costs a call about 3 s of silence before its first word, and while the key or the service stayed broken
+# every call paid it. Kept per process: on LiveKit and the phone lines one process takes every call.
+CLOUD_RETRY_AFTER = float(os.getenv("CLOUD_VOICE_RETRY_AFTER", "300"))
+cloud_down_until = 0.0  # time.monotonic() before which calls go straight to Kokoro
 
 
 HOTWORDS = "Bright Smile Dental, Cigna, Delta Dental, MetLife, Aetna, Medicare, Apple Pay, Riverside Orthodontics"
@@ -252,7 +258,10 @@ async def bot(runner_args: RunnerArguments):
     )
     tts = KokoroTTSService(model_path=KOKORO_FILES[0], voices_path=KOKORO_FILES[1],
                            settings=KokoroTTSService.Settings(voice=VOICE))
-    if TTS == "elevenlabs":
+    if TTS == "elevenlabs" and time.monotonic() < cloud_down_until:
+        logger.info(f"the cloud voice is down, so this call uses Kokoro; ElevenLabs is tried again in "
+                    f"{cloud_down_until - time.monotonic():.0f} s")
+    elif TTS == "elevenlabs":
         # Flash v2.5 by default, ElevenLabs' lowest-latency model. It streams over one websocket per call.
         cloud = ElevenLabsTTSService(api_key=os.environ["ELEVENLABS_API_KEY"],
                                      settings=ElevenLabsTTSService.Settings(voice=os.getenv("ELEVENLABS_VOICE_ID", SARAH)))
@@ -298,13 +307,16 @@ async def bot(runner_args: RunnerArguments):
         for line in breakdown.turn_contribution_lines():
             logger.info(f"    {line}")
 
-    if TTS == "elevenlabs":
+    if isinstance(tts, ServiceSwitcher):
         @tts.strategy.event_handler("on_service_switched")
         async def on_voice_switched(strategy, service):
             # The reply ElevenLabs had when it failed is lost: with a bad key that was the greeting, and the caller
             # heard nothing until they spoke. The context only keeps what was actually spoken, so if none of this
             # reply was, it is asked for again and said in the local voice.
-            logger.warning(f"the cloud voice failed, carrying on with {service.name}")
+            global cloud_down_until
+            cloud_down_until = time.monotonic() + CLOUD_RETRY_AFTER
+            logger.warning(f"the cloud voice failed, carrying on with {service.name}; new calls skip it for "
+                           f"{CLOUD_RETRY_AFTER:.0f} s")
             last = context.messages[-1] if context.messages else {}
             if not (isinstance(last, dict) and last.get("role") == "assistant"):
                 await worker.queue_frames([LLMRunFrame()])

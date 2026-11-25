@@ -123,7 +123,7 @@ Each phase is one or two commits, so the history reads in the same order as this
 | 6 | Automated voice evals | p50 3.5 s, p95 4.6 s with the harness sharing the machine |
 | 7 | Clinic knowledge base, keypad entry for phone numbers | p50 3.5 s, p95 4.9 s in the eval run; retrieval adds 17 to 37 ms a turn |
 | 8 | LiveKit rooms, a warm transfer to a person at the front desk, OpenTelemetry traces, a switchable cloud voice, Plivo and Exotel phone lines | 1.6 to 2.2 s on scripted LiveKit calls |
-| 9 (in progress) | Hardening for real calls: caller details kept out of traces | unchanged |
+| 9 (in progress) | Hardening for real calls: caller details kept out of traces, a failed cloud voice skipped for a while | unchanged |
 
 "Simulated" means synthetic caller audio fed through the real pipeline with playback muted. "Live" means a
 person talking into a microphone.
@@ -621,6 +621,26 @@ The check's first version was too strict: it wanted a timing and a token count o
 the caller hangs up on mid-reply leaves an LLM span that never got either, so the check now asks only that they
 arrive where Pipecat recorded them.
 
+**Step 2, a failed cloud voice is skipped for a while (done).** Kokoro took over when ElevenLabs failed, but
+only within that call. Every new call tried ElevenLabs first, waited through its three refused connections, and
+started speaking late, for as long as the key or the service stayed broken. Now the first failure makes the bot
+skip ElevenLabs for 5 minutes (`CLOUD_VOICE_RETRY_AFTER`, in seconds); new calls go straight to Kokoro, and the
+first call after that tries ElevenLabs again. One process takes every call on LiveKit and the phone lines, so
+the whole line recovers at once.
+
+Measured with a refused key, from a call's pipeline being built to the bot's first word:
+
+| | First call | Later calls |
+|---|---|---|
+| Before | 4.2 to 4.8 s (four calls, every one tried ElevenLabs) | 4.2 to 4.8 s |
+| After | 4.8 to 5.0 s, then Kokoro | 0.9 s, straight to Kokoro |
+
+With a 15 s cool-down and a 20 s pause between calls, the first call after the pause tried ElevenLabs again and
+the one after it skipped it, as intended. `evals/failover.yaml` has a new scenario, a later call that must start
+speaking within 2.5 s: it passed 3 of 3 times on a fresh bot each time, and failed with the cool-down turned off
+(`CLOUD_VOICE_RETRY_AFTER=0`), so it does catch the old behaviour. On the default Kokoro voice the three
+failover scenarios passed too.
+
 ## Run it
 
 Tested on Windows 10 with Python 3.13, an Intel i5-10400F and a GTX 1660 (6 GB). An NVIDIA GPU is optional but
@@ -703,7 +723,8 @@ transfer test (close the staff page first, since it counts as someone at the des
 ```
 
 Use the ElevenLabs voice. Add your key as a user environment variable once, then start the bot with the switch
-set. To check the fallback to Kokoro, use a fake key and run the failover scenarios:
+set. To check the fallback to Kokoro, use a fake key and run the failover scenarios. After a failure the bot
+skips ElevenLabs for `CLOUD_VOICE_RETRY_AFTER` seconds, 300 by default:
 
 ```powershell
 [Environment]::SetEnvironmentVariable("ELEVENLABS_API_KEY", "your-key", "User")
@@ -773,8 +794,8 @@ $env:APPOINTMENTS_DB = "fresh"
   hosted LiveKit server.
 - **Aetna is still misheard** in one voice of three, even with hotwords.
 - **The ElevenLabs voice has not spoken yet:** it is built and its failure path is tested, but without a key
-  its latency, cost and sound are unmeasured. When it fails, every new call tries it again first, so each one
-  starts about 3 s late until the key or the service is fixed.
+  its latency, cost and sound are unmeasured. When it fails, the bot stops trying it for 5 minutes, but the call
+  that finds it broken still starts about 3 s late, and so does the first call after each 5 minutes.
 - **Transfers need LiveKit.** On the browser client and the Twilio line the bot can only take a message.
 - **A caller on hold cannot change their mind:** their words are dropped until staff answer or the bot comes
   back, so "never mind" is not heard.
