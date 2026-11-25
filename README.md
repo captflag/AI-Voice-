@@ -123,7 +123,7 @@ Each phase is one or two commits, so the history reads in the same order as this
 | 6 | Automated voice evals | p50 3.5 s, p95 4.6 s with the harness sharing the machine |
 | 7 | Clinic knowledge base, keypad entry for phone numbers | p50 3.5 s, p95 4.9 s in the eval run; retrieval adds 17 to 37 ms a turn |
 | 8 | LiveKit rooms, a warm transfer to a person at the front desk, OpenTelemetry traces, a switchable cloud voice, Plivo and Exotel phone lines | 1.6 to 2.2 s on scripted LiveKit calls |
-| 9 (in progress) | Hardening for real calls: caller details kept out of traces, a failed cloud voice skipped for a while | unchanged |
+| 9 (in progress) | Hardening for real calls: caller details kept out of traces, a failed cloud voice skipped for a while, "never mind" on hold | unchanged |
 
 "Simulated" means synthetic caller audio fed through the real pipeline with playback muted. "Live" means a
 person talking into a microphone.
@@ -486,6 +486,7 @@ sequenceDiagram
 | Declined | The bot comes back and offers a message |
 | No answer | Hold music and a reminder play; after 30 s the desk is told the transfer was withdrawn and the bot offers a message |
 | Caller hangs up | The desk is told the caller hung up |
+| Never mind (phase 9) | On hold, "how much longer?" leaves the hold alone; "never mind" withdraws the transfer from the desk and the bot comes back to the caller |
 
 All 19 checks passed in each of three rounds, fifteen calls, the first two back to back on one bot. The staff
 page was also tried in a browser: the briefing card appeared, Accept moved it into the caller's room, and the
@@ -640,6 +641,24 @@ the one after it skipped it, as intended. `evals/failover.yaml` has a new scenar
 speaking within 2.5 s: it passed 3 of 3 times on a fresh bot each time, and failed with the cool-down turned off
 (`CLOUD_VOICE_RETRY_AFTER=0`), so it does catch the old behaviour. On the default Kokoro voice the three
 failover scenarios passed too.
+
+**Step 3, "never mind" on hold (done).** A caller on hold could not change their mind. Testing it showed the
+cause was deeper than the hold gate dropping their words: nothing they said on hold was even transcribed.
+Whisper here transcribes only between the voice detector's start and stop frames, and the detector lives in the
+turn aggregator after the gate, which hears nothing while the caller holds.
+
+So while the gate is closed it now runs a voice detector of its own and sends its start and stop frames back up
+to speech-to-text alone. The words that come back go to the desk instead of to the model. A short list of
+phrases ("never mind", "forget it", "I'll call back later", "I've changed my mind") calls the transfer off: the
+desk is told, the hold music stops, and the bot is told what the caller said and asks if there is anything else.
+Anything else said on hold is ignored, as before, so "how much longer will this take?" leaves the hold alone.
+The turn aggregator still sees nothing during a hold, so nothing interrupts the hold line or starts a turn. Once
+staff have pressed Accept, "never mind" is ignored: they are already on their way into the call.
+
+A new scenario in `evals/transfer_call.py` asks "How much longer will this take?" on hold, checks that the desk
+is not told anything for 8 s, then says "Actually, never mind. I'll call back later." The full transfer test, now
+six scenarios and 24 checks, passed **24 of 24** in each of two rounds. Across all of those calls, nothing was
+transcribed on hold except in this scenario, so the gate's detector did not pick up the hold music.
 
 ## Run it
 
@@ -797,8 +816,8 @@ $env:APPOINTMENTS_DB = "fresh"
   its latency, cost and sound are unmeasured. When it fails, the bot stops trying it for 5 minutes, but the call
   that finds it broken still starts about 3 s late, and so does the first call after each 5 minutes.
 - **Transfers need LiveKit.** On the browser client and the Twilio line the bot can only take a message.
-- **A caller on hold cannot change their mind:** their words are dropped until staff answer or the bot comes
-  back, so "never mind" is not heard.
+- **On hold, only a few phrases are understood.** "Never mind" and a handful like it call a transfer off;
+  any other request, such as "actually, can I just book a cleaning?", waits until the bot comes back.
 - **Logs still hold what callers said.** Traces leave it out, but the bot's own log prints transcripts, the
   text it speaks and tool arguments, as it always has, for debugging. A real clinic would need those logs
   turned down or kept under the same rules as call recordings.

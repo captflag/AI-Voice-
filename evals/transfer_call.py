@@ -12,6 +12,8 @@ Scenarios:
     declined     staff decline: the bot comes back and offers to take a message
     no_answer    staff ignore the transfer: after 30 s the bot comes back and the desk is told it was withdrawn
     hung_up      the caller hangs up while on hold: the desk is told
+    never_mind   on hold, the caller asks how long it will take (the hold goes on), then says "never mind": the
+                 desk is told the transfer is off and the bot comes back to the caller
 """
 import asyncio
 import os
@@ -126,7 +128,27 @@ async def hung_up():
     await staff.leave()
 
 
-SCENARIOS = {f.__name__: f for f in (connected, nobody, declined, no_answer, hung_up)}
+async def never_mind():
+    staff = await at_desk()
+    caller, asked = await caller_asks()
+    check(await staff.wait_for_data("brief", 30), "staff got the briefing")
+    await asyncio.sleep(4)
+    await asyncio.sleep(max(0.0, caller.say("How much longer will this take?") - time.monotonic()))
+    check(not await staff.wait_for_data("withdrawn", 8), "a question on hold does not call the transfer off")
+    await asyncio.sleep(max(0.0, caller.say("Actually, never mind. I'll call back later.") - time.monotonic()))
+    withdrawn = await staff.wait_for_data("withdrawn", 15)
+    check(withdrawn and "no longer" in withdrawn.get("text", ""), "the desk was told the caller called it off",
+          withdrawn)
+    since = time.monotonic()
+    await asyncio.sleep(10)
+    text = caller.transcript(since, time.monotonic())
+    check(re.search(r"anything else|help|no problem|of course|okay|sure", text, re.I),
+          "the bot came back to the caller", text)
+    check(not caller.left and not await staff.wait_for_data("join", 1), "nobody was put through, and the bot stayed")
+    await asyncio.gather(staff.leave(), caller.leave())
+
+
+SCENARIOS = {f.__name__: f for f in (connected, nobody, declined, no_answer, hung_up, never_mind)}
 
 
 async def main():

@@ -278,7 +278,8 @@ async def bot(runner_args: RunnerArguments):
         user_params=LLMUserAggregatorParams(vad_analyzer=LoudnessLoggingVAD(params=VADParams(min_volume=MIN_VOLUME))),
     )
 
-    gate = transfer.HoldGate()
+    # The gate's own voice detector hears a caller on hold, so a "never mind" can still be understood.
+    gate = transfer.HoldGate(vad=SileroVADAnalyzer(params=VADParams(min_volume=MIN_VOLUME)))
     pipeline = Pipeline([
         transport.input(),     # caller audio in
         stt,
@@ -342,6 +343,7 @@ async def bot(runner_args: RunnerArguments):
         desk = transfer.Desk(runner_args.url, runner_args.room_name, gate, worker, context,
                              functools.partial(kokoro_tts.Kokoro, *KOKORO_FILES), VOICE)
         llm.desk = desk  # transfer_to_staff in tools.py finds it here
+        gate.on_words = desk.caller_said  # what the caller says on hold
 
         @transport.event_handler("on_participant_connected")
         async def on_participant_connected(transport, identity):
