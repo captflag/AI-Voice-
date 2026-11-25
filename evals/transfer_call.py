@@ -14,6 +14,8 @@ Scenarios:
     hung_up      the caller hangs up while on hold: the desk is told
     never_mind   on hold, the caller asks how long it will take (the hold goes on), then says "never mind": the
                  desk is told the transfer is off and the bot comes back to the caller
+    queue        two callers ask for a person: the second hears it is number 2 in line, staff are briefed about
+                 one caller at a time, and both are put through in turn
 """
 import asyncio
 import os
@@ -23,11 +25,12 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from livekit_call import LOUD, Line, rms, start_call  # noqa: E402  (same folder)
+from livekit_call import LOUD, Line, rms, speech, start_call  # noqa: E402  (same folder)
 from transfer import ANSWER_WITHIN, DESK, token  # noqa: E402
 
 ASK = "Hi, I'd like to speak to a real person about a charge on my bill, please."
 STAFF_SAYS = "Hi, this is Sam at the front desk. How can I help with your bill?"
+SECOND_ASK = "Hi, could I speak to someone about my insurance claim, please?"
 results = []
 
 
@@ -148,7 +151,50 @@ async def never_mind():
     await asyncio.gather(staff.leave(), caller.leave())
 
 
-SCENARIOS = {f.__name__: f for f in (connected, nobody, declined, no_answer, hung_up, never_mind)}
+async def put_through(staff, caller):
+    """Staff at the desk accept, move into the caller's room, and wait for the bot to leave it."""
+    await staff.send({"type": "accept"})
+    join = await staff.wait_for_data("join", 10)
+    if join:
+        await staff.leave()
+        staff.data = []
+        await staff.join(join["url"], join["token"])
+        for _ in range(200):
+            if caller.left:
+                break
+            await asyncio.sleep(0.1)
+    return bool(join and caller.left)
+
+
+async def queue():
+    speech(SECOND_ASK, Line().speaker)  # synthesised now: mid-call it would deafen the line for most of a second
+    staff = await at_desk()
+    first, _ = await caller_asks()
+    brief = await staff.wait_for_data("brief", 30)
+    check(brief and re.search(r"bill|charge", brief["text"], re.I), "staff were briefed about the first caller",
+          brief and brief["text"])
+    second = Line()
+    await second.join(*await start_call())
+    await second.reply(time.monotonic())
+    asked = second.say(SECOND_ASK)
+    _, held = await second.reply(asked)
+    check(re.search(r"number (2|two)|second in line", held, re.I), "the second caller heard it is number 2 in line",
+          held)
+    briefs = [d["text"] for d in staff.data if d.get("type") == "brief"]
+    check(not any(re.search(r"insurance", b, re.I) for b in briefs),
+          "while the first caller was at the front, staff saw only that briefing", briefs)
+    check(await put_through(staff, first), "the first caller was put through")
+    await staff.leave()  # the first call is over; back to the desk
+    staff.data = []
+    await staff.join(os.environ["LIVEKIT_URL"], token(DESK, "staff-sam", "Sam"))
+    brief = await staff.wait_for_data("brief", 30)
+    check(brief and re.search(r"insurance|claim", brief["text"], re.I),
+          "back at the desk, staff were briefed about the second caller", brief and brief["text"])
+    check(await put_through(staff, second), "the second caller was put through")
+    await asyncio.gather(staff.leave(), first.leave(), second.leave())
+
+
+SCENARIOS = {f.__name__: f for f in (connected, nobody, declined, no_answer, hung_up, never_mind, queue)}
 
 
 async def main():

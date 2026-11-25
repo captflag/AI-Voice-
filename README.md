@@ -16,9 +16,9 @@ ElevenLabs, with Kokoro taking over if it fails.
 **Latest results:** 13 of 13 simulated voice calls passed in the latest run of the suite, in phase 9
 ([docs/eval-report.md](docs/eval-report.md)); the last three-run suite passed 38 of 39 (the miss was a test
 artefact, fixed and rerun 5 of 5). 250 of 250 replies passed the grounding test (25 cases, ten runs each), and
-24 of 24 checks passed in each round of the warm-transfer test on LiveKit. Details in
+30 of 30 checks passed in each round of the warm-transfer test on LiveKit. Details in
 [phase 7](#phase-7-clinic-knowledge-base), [phase 8](#phase-8-handing-a-call-to-a-person) and
-[phase 9](#phase-9-hardening-for-real-calls-in-progress).
+[phase 9](#phase-9-hardening-for-real-calls).
 
 ## System design
 
@@ -123,7 +123,7 @@ Each phase is one or two commits, so the history reads in the same order as this
 | 6 | Automated voice evals | p50 3.5 s, p95 4.6 s with the harness sharing the machine |
 | 7 | Clinic knowledge base, keypad entry for phone numbers | p50 3.5 s, p95 4.9 s in the eval run; retrieval adds 17 to 37 ms a turn |
 | 8 | LiveKit rooms, a warm transfer to a person at the front desk, OpenTelemetry traces, a switchable cloud voice, Plivo and Exotel phone lines | 1.6 to 2.2 s on scripted LiveKit calls |
-| 9 (in progress) | Hardening for real calls: caller details kept out of traces, a failed cloud voice skipped for a while, "never mind" on hold, "mm-hmm" no longer interrupts | unchanged by the turn-start change |
+| 9 | Hardening for real calls: caller details kept out of traces, a failed cloud voice skipped for a while, "never mind" on hold, "mm-hmm" no longer interrupts, a queue at the front desk | unchanged by the turn-start change |
 
 "Simulated" means synthetic caller audio fed through the real pipeline with playback muted. "Live" means a
 person talking into a microphone.
@@ -487,6 +487,7 @@ sequenceDiagram
 | No answer | Hold music and a reminder play; after 30 s the desk is told the transfer was withdrawn and the bot offers a message |
 | Caller hangs up | The desk is told the caller hung up |
 | Never mind (phase 9) | On hold, "how much longer?" leaves the hold alone; "never mind" withdraws the transfer from the desk and the bot comes back to the caller |
+| Queue (phase 9) | Two callers ask for a person: staff see one briefing at a time, the second caller hears it is number 2 in line, and both are put through in turn |
 
 All 19 checks passed in each of three rounds, fifteen calls, the first two back to back on one bot. The staff
 page was also tried in a browser: the briefing card appeared, Accept moved it into the caller's room, and the
@@ -531,8 +532,8 @@ about:
 ![A transferred call in Jaeger: two turns, the tool call, and the 21.7 s transfer span with its events](docs/jaeger-transfer-trace.jpg)
 
 The call above, in Jaeger: the transfer span shows the caller held for 21.7 s, and that 15.6 s of that was the
-bot reading the briefing aloud before the scripted staff member, who waits to hear it all, pressed Accept. A
-person can accept from the written card while it plays.
+bot reading the briefing aloud before the scripted staff member, who waits to hear it all, pressed Accept. An
+Accept pressed earlier, from the written card, only took effect once the reading ended; phase 9 fixed that.
 
 `evals/trace_check.py` stands in for the backend: it takes the bot's spans on Jaeger's port, runs the
 "connected" and "nobody at the desk" transfer calls, and checks that each call is one trace with the shape above,
@@ -594,11 +595,11 @@ finished.
 | The simulator crashed when the bot hung up on a caller who said "yes" to "anything else?" | The bot was right to end the call; the simulator now treats the bot hanging up as the end of the call |
 | A second round on the same bot found every slot taken: the calls share one bot and one appointment book | Each line asks for a different time, and each round starts a fresh bot |
 
-### Phase 9: hardening for real calls (in progress)
+### Phase 9: hardening for real calls
 
 Phase 8 built the job description's stack; phase 9 fixes what would hurt on real calls, one known limit at a
-time, using nothing that needs a new account or key. Planned: caller details out of traces, a cloud voice that
-stops being retried while it is down, a caller on hold who can say "never mind", "mm-hm" not counting as an
+time, using nothing that needs a new account or key: caller details out of traces, a cloud voice that stops
+being retried while it is down, a caller on hold who can say "never mind", "mm-hmm" not counting as an
 interruption, and a queue at the front desk.
 
 **Step 1, caller details out of traces (done).** A dental clinic's calls are health records, and phase 8's
@@ -696,6 +697,29 @@ speech-to-text, 0.38 to 0.56 s, and the voice's first audio, 0.87 to 1.14 s, GPU
 The test had a flaw of its own at first. The scripted caller synthesised each line with Kokoro mid-call, which
 blocks it for most of a second, during which it heard nothing, so the bot seemed to go quiet the moment the
 caller spoke, whatever it did. Lines are now synthesised before the call.
+
+**Step 5, a queue at the front desk (done).** Every bot waiting on a transfer sat in the desk room, and the
+staff page sends Accept to everyone in it. Two transfers at once would both have taken the same Accept, and
+both sent the staff member a join link. Now transfers queue (`QUEUE` in `transfer.py`): only the caller at the
+front has a bot in the desk room, so staff see one briefing at a time, and their Accept reaches only that
+caller's bot. Callers behind hear their place in line, in the hold line and in each reminder ("You're number 2
+in line"). When the front of the queue is settled (put through, declined, unanswered, called off or hung up),
+the next caller moves up and its bot briefs the desk. It may move up while the staff member is still on the
+previous call, so it waits for someone to be at the desk; past 3 minutes on hold in all, the bot comes back and
+offers to take a message.
+
+A new scenario in `evals/transfer_call.py` has two callers ask for a person, a billing question and then an
+insurance claim, with one member of staff at the desk. It checks that staff see only the first briefing, that
+the second caller hears it is number 2, and that staff put the first caller through, come back to the desk, get
+the second briefing and put that caller through too. The full transfer test, now seven scenarios and 30 checks,
+passed **30 of 30** in each of two rounds, and the no-answer scenario 15 of 15 on its own three times. One
+earlier round had the no-answer scenario fail two checks; it did not come back in five more runs.
+
+| What the queue test found | Fix |
+|---|---|
+| An Accept pressed while the briefing was still being read out waited for the end of the reading, about 15 s: the scripted staff accepted at once and gave up waiting for the join | An Accept now cuts the reading short |
+| A member of staff who accepts the moment they join can be quicker than the room telling the bot they have arrived: the Accept named no sender, the handler crashed, and the Accept was lost. Seen 0.5 s apart | An Accept from an unknown sender waits up to 2 s for the room to say who is at the desk |
+| Cutting the reading short could land mid-publish, and LiveKit's SDK logged a KeyError for a track it had not recorded | The publish is shielded; only the reading stops |
 
 ## Run it
 
@@ -861,5 +885,6 @@ $env:APPOINTMENTS_DB = "fresh"
 - **Logs still hold what callers said.** Traces leave it out, but the bot's own log prints transcripts, the
   text it speaks and tool arguments, as it always has, for debugging. A real clinic would need those logs
   turned down or kept under the same rules as call recordings.
-- **One desk, first to accept wins.** There is no queue order, no skills routing and no transfer to a staff
-  member's phone, which would need LiveKit's SIP service.
+- **One desk, in one process.** Transfers queue in order, but the queue lives in the bot process; bots spread
+  over several processes would need it in shared storage. There is no routing by skill and no transfer to a
+  staff member's phone, which would need LiveKit's SIP service.

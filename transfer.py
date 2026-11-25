@@ -11,6 +11,9 @@ Staff wait in a LiveKit room of their own, the desk (staff.py serves the page th
     4. fallback  nobody at the desk, a decline, or no answer in 30 s: the music stops and the bot is told to
                  offer to take a message instead
 
+Transfers queue for the desk (QUEUE): only the caller at the front has a bot in the desk room, so staff see one
+briefing at a time and their Accept reaches only that caller's bot. Callers behind hear their place in line.
+
 The tool the model calls is transfer_to_staff in tools.py; it finds this object as params.llm.desk. Each transfer
 is a "transfer" span (telemetry.py) from the briefing to its outcome, so its length is how long the caller held.
 """
@@ -19,6 +22,7 @@ import json
 import os
 import re
 import tempfile
+import time
 import wave
 
 import numpy as np
@@ -38,6 +42,12 @@ ANSWER_WITHIN = 30     # seconds after the spoken briefing ends (staff can accep
 REMIND_EVERY = 20      # seconds between "thanks for holding" lines
 RATE = 24000           # the bot's output rate, which the hold music must match
 BOT_ID = "receptionist"
+MAX_HOLD = 180         # seconds a caller holds in all: waiting in line, or for staff to come back to the desk
+# Transfers waiting for the desk, first in line first. Before this, every waiting bot sat in the desk room, and an
+# Accept, which the staff page sends to everyone in it, reached all of them: two transfers at once both took it.
+# ponytail: kept in this process, which takes every LiveKit call; bots spread over several processes would need it
+# in shared storage, such as Redis or the desk room's metadata.
+QUEUE = []
 # What a caller on hold says to call the transfer off. Anything else said on hold is ignored, as before: "how much
 # longer?" must not cancel it, so the list is narrow on purpose.
 NEVER_MIND = re.compile(r"\b(never ?mind|forget (about )?it|don'?t bother|i'?ve changed my mind|i changed my mind"
@@ -124,53 +134,80 @@ class Desk:
         self.staff = None         # identity of whoever accepted
         self.task = None
         self.joined = asyncio.Event()
-        self.outcome = None       # "connected", "no staff", "declined", "no answer", "caller hung up",
-        #                           "caller cancelled"
+        self.outcome = None       # "connected", "no staff", "declined", "no answer", "desk busy",
+        #                           "caller hung up", "caller cancelled"
+        self.turn = asyncio.Event()  # set when this transfer reaches the front of QUEUE
 
     async def begin(self, reason, summary):
         """Start a transfer. Returns None once the caller is on hold, or why it could not start."""
         if self.task and not self.task.done():
             return None  # already on hold: a repeated request changes nothing and says nothing
         self.joined.clear()
+        self.turn.clear()
         brief = f"Transfer from the receptionist. Reason: {reason}. {summary}"
-        self.room = rtc.Room()
-        # The written briefing travels in the bot's join token, so staff see it the moment the bot appears. Sent
-        # as a data message straight after joining, it was lost by a browser that was still setting up the
-        # connection it receives on.
-        await self.room.connect(self.url, token(DESK, f"{BOT_ID}-{self.caller_room}", "Receptionist",
-                                                {"brief": brief}))
-        staff = [p.identity for p in self.room.remote_participants.values() if not p.identity.startswith(BOT_ID)]
+        # A quick look into the desk room, with no briefing, to see whether anyone is there.
+        look = rtc.Room()
+        await look.connect(self.url, token(DESK, f"{BOT_ID}-{self.caller_room}-look", "Receptionist"))
+        staff = [p for p in look.remote_participants if not p.startswith(BOT_ID)]
+        await look.disconnect()
+        place = len(QUEUE) + 1
         # A child of the transfer_to_staff tool span, but it runs on until the transfer ends. The summary is left
         # out of it: it holds the caller's name and number.
-        self.span = tracer.start_span("transfer", attributes={"transfer.reason": reason,
-                                                              "transfer.staff_at_desk": len(staff)})
+        self.span = tracer.start_span("transfer", attributes={"transfer.reason": reason, "transfer.queue_position":
+                                                              place, "transfer.staff_at_desk": len(staff)})
         if not staff:
-            await self.room.disconnect()
-            self.room, self.outcome = None, "no staff"
+            self.outcome = "no staff"
             self._finish()
             logger.info("transfer: nobody at the desk")
             return "Nobody is at the front desk right now. Offer to take a message so someone can call back."
-        logger.info(f"transfer: {len(staff)} at the desk, briefing them: {reason}")
+        QUEUE.append(self)
+        logger.info(f"transfer: {len(staff)} at the desk, number {place} in line: {reason}")
         self.gate.closed = True
-        await self.worker.queue_frames([TTSSpeakFrame("Of course. Please hold for a moment while I get someone "
-                                                      "from the front desk."), MixerEnableFrame(True)])
+        line = "Of course. Please hold for a moment while I get someone from the front desk."
+        if place > 1:
+            line += f" You're number {place} in line."
+        await self.worker.queue_frames([TTSSpeakFrame(line), MixerEnableFrame(True)])
         self.task = asyncio.create_task(self._run(brief))
         return None
 
     async def _run(self, brief):
         answered = asyncio.get_running_loop().create_future()
-
-        @self.room.on("data_received")
-        def on_data(packet: rtc.DataPacket):
-            message = json.loads(packet.data)
-            if message.get("type") in ("accept", "decline") and not answered.done():
-                answered.set_result((message["type"], packet.participant.identity))
-
         reminders = asyncio.create_task(self._remind())
+        deadline = time.monotonic() + MAX_HOLD
+        briefed = False
         try:
-            await self._say(brief + " Press accept to take the call.")
+            while QUEUE[0] is not self:
+                await asyncio.wait_for(self.turn.wait(), deadline - time.monotonic())
+                self.turn.clear()
+            self.span.add_event("front of the queue")
+            self.room = rtc.Room()
+
+            @self.room.on("data_received")
+            def on_data(packet: rtc.DataPacket):
+                message = json.loads(packet.data)
+                if message.get("type") in ("accept", "decline") and not answered.done():
+                    # The sender can be unknown: see _staff_member.
+                    answered.set_result((message["type"], packet.participant and packet.participant.identity))
+
+            # The written briefing travels in the bot's join token, so staff see it the moment the bot appears.
+            # Sent as a data message straight after joining, it was lost by a browser that was still setting up the
+            # connection it receives on.
+            await self.room.connect(self.url, token(DESK, f"{BOT_ID}-{self.caller_room}", "Receptionist",
+                                                    {"brief": brief}))
+            # Whoever took the last transfer may still be on that call: wait for someone to be at the desk.
+            while not [p for p in self.room.remote_participants if not p.startswith(BOT_ID)]:
+                if time.monotonic() > deadline:
+                    raise TimeoutError
+                await asyncio.sleep(0.5)
+            # Staff can answer from the written card while the briefing is still being read out. The answer used
+            # to wait for the end of it, about 15 s; now it cuts the briefing short.
+            reading = asyncio.create_task(self._say(brief + " Press accept to take the call."))
+            await asyncio.wait({reading, answered}, return_when=asyncio.FIRST_COMPLETED)
+            reading.cancel()
+            briefed = True
             self.span.add_event("staff briefed")
             choice, who = await asyncio.wait_for(answered, ANSWER_WITHIN)
+            who = who or await self._staff_member()
             self.span.add_event(choice, {"staff": who})
             if choice == "decline":
                 return await self._fall_back("declined", "The front desk could not take the call.")
@@ -187,10 +224,17 @@ class Desk:
                                             EndWorkerFrame()])
         except TimeoutError:
             await self._send({"type": "withdrawn"})
-            await self._fall_back("no answer", "Nobody at the front desk answered within 30 seconds.")
+            if briefed:
+                await self._fall_back("no answer", "Nobody at the front desk answered within 30 seconds.")
+            else:
+                await self._fall_back("desk busy", "Everyone at the front desk is still busy with other callers.")
         finally:
             reminders.cancel()
             await self._leave_desk()
+            if self in QUEUE:
+                QUEUE.remove(self)
+            if QUEUE:
+                QUEUE[0].turn.set()  # the next caller in line moves up
             self._finish()
 
     def _finish(self):
@@ -236,10 +280,27 @@ class Desk:
                                   "so someone can call them back."})
         await self.worker.queue_frames([MixerEnableFrame(False), LLMRunFrame()])
 
+    async def _staff_member(self):
+        """Who from the staff is at the desk, waiting up to 2 s for the room to say.
+
+        A member of staff who answers the moment they join can be quicker than the room telling the bot they have
+        arrived: the answer then names no sender, and the bot could not address the join to anyone. Found by the
+        queue test, where staff come back to the desk and accept at once; seen 0.5 s apart.
+        """
+        for _ in range(40):
+            staff = [p for p in self.room.remote_participants if not p.startswith(BOT_ID)]
+            if staff:
+                return staff[0]
+            await asyncio.sleep(0.05)
+        raise TimeoutError
+
     async def _remind(self):
         while True:
             await asyncio.sleep(REMIND_EVERY)
-            await self.worker.queue_frames([TTSSpeakFrame("Thanks for holding, I'm still getting someone for you.")])
+            place = QUEUE.index(self) + 1 if self in QUEUE else 1
+            line = (f"Thanks for holding. You're number {place} in line." if place > 1
+                    else "Thanks for holding, I'm still getting someone for you.")
+            await self.worker.queue_frames([TTSSpeakFrame(line)])
 
     async def _send(self, message, to=None):
         if self.room:
@@ -250,8 +311,10 @@ class Desk:
         """Speak into the desk room only, with the bot's own voice model."""
         source = rtc.AudioSource(RATE, 1)
         track = rtc.LocalAudioTrack.create_audio_track("briefing", source)
-        await self.room.local_participant.publish_track(track, rtc.TrackPublishOptions(
-            source=rtc.TrackSource.SOURCE_MICROPHONE))
+        # Shielded: an Accept can cut the briefing short mid-publish, and the SDK then logged a KeyError for a track
+        # it was told about but had not recorded. The publish always finishes; only the reading stops.
+        await asyncio.shield(self.room.local_participant.publish_track(track, rtc.TrackPublishOptions(
+            source=rtc.TrackSource.SOURCE_MICROPHONE)))
         # self.kokoro loads the model; bot.py shares one copy per process, so a Kokoro call does not load a second
         samples, rate = await asyncio.to_thread(lambda: self.kokoro().create(text, voice=self.voice, speed=1.0,
                                                                              lang="en-us"))
