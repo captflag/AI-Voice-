@@ -18,7 +18,7 @@ changes, with replies at p50 2.5 s ([docs/eval-report.md](docs/eval-report.md));
 passed 38 of 39 (the miss was a test artefact, fixed and rerun 5 of 5). 250 of 250 replies passed the
 grounding test (25 cases, ten runs each), and 19 of 19 checks passed in each round of the warm-transfer test on
 LiveKit. Details in [phase 7](#phase-7-clinic-knowledge-base) and
-[phase 8](#phase-8-handing-a-call-to-a-person-in-progress).
+[phase 8](#phase-8-handing-a-call-to-a-person).
 
 ## System design
 
@@ -122,7 +122,8 @@ Each phase is one or two commits, so the history reads in the same order as this
 | 5 | Booking tools | Tool turns take two LLM round trips |
 | 6 | Automated voice evals | p50 3.5 s, p95 4.6 s with the harness sharing the machine |
 | 7 | Clinic knowledge base, keypad entry for phone numbers | p50 3.5 s, p95 4.9 s in the eval run; retrieval adds 17 to 37 ms a turn |
-| 8 (in progress) | LiveKit rooms, a warm transfer to a person at the front desk, OpenTelemetry traces, a switchable cloud voice, Plivo and Exotel phone lines | 1.6 to 2.2 s on scripted LiveKit calls |
+| 8 | LiveKit rooms, a warm transfer to a person at the front desk, OpenTelemetry traces, a switchable cloud voice, Plivo and Exotel phone lines | 1.6 to 2.2 s on scripted LiveKit calls |
+| 9 (in progress) | Hardening for real calls: caller details kept out of traces | unchanged |
 
 "Simulated" means synthetic caller audio fed through the real pipeline with playback muted. "Live" means a
 person talking into a microphone.
@@ -398,7 +399,7 @@ Reply latency was p50 3.5 s and p95 4.9 s over 16 replies, with stage medians of
 moved between 2.9 and 3.5 s: with 16 to 18 timed replies a run, it mostly reflects how many of them needed a
 tool call. LLM cost was $0.0007 a call, or $0.0015 a minute of call.
 
-### Phase 8: handing a call to a person (in progress)
+### Phase 8: handing a call to a person
 
 The goal is a warm transfer: the bot puts the caller on hold, briefs a member of staff privately, then connects
 them and leaves. That needs three people in one call, and every transport so far connects one caller to the
@@ -592,6 +593,34 @@ finished.
 | The simulator crashed when the bot hung up on a caller who said "yes" to "anything else?" | The bot was right to end the call; the simulator now treats the bot hanging up as the end of the call |
 | A second round on the same bot found every slot taken: the calls share one bot and one appointment book | Each line asks for a different time, and each round starts a fresh bot |
 
+### Phase 9: hardening for real calls (in progress)
+
+Phase 8 built the job description's stack; phase 9 fixes what would hurt on real calls, one known limit at a
+time, using nothing that needs a new account or key. Planned: caller details out of traces, a cloud voice that
+stops being retried while it is down, a caller on hold who can say "never mind", "mm-hm" not counting as an
+interruption, and a queue at the front desk.
+
+**Step 1, caller details out of traces (done).** A dental clinic's calls are health records, and phase 8's
+traces held whole calls. Pipecat's spans record what the caller said, every line the bot spoke, the messages and
+system prompt sent to Claude (which carries the caller's number from caller ID), tool arguments and results, and
+the LLM's settings, which repeat the system prompt. All of that went to the trace backend.
+
+Spans now pass through a redacting exporter (`telemetry.py`) on the way out. It keeps an allowlist of attributes
+that cannot hold anything said on a call: timings, token counts, model names, turn numbers, outcomes. Everything
+else is dropped, on the spans and on their events. An allowlist fails closed: an attribute a later Pipecat adds
+is lost from the traces rather than leaked into them. `TRACE_CALL_CONTENT=1` keeps everything, for debugging on
+your own machine.
+
+`evals/trace_check.py` now looks through every attribute of every span of each call for words from it: the
+caller's request and the clinic's name, which the greeting and the system prompt both contain. It also checks
+that every attribute that arrived is on the allowlist, and that the LLM's timings and token counts survived.
+With redaction on, **38 of 38** checks passed in each of two rounds. The same calls with `TRACE_CALL_CONTENT=1`
+showed the words in the spans, so the check does catch a leak when there is one.
+
+The check's first version was too strict: it wanted a timing and a token count on every LLM span. A call that
+the caller hangs up on mid-reply leaves an LLM span that never got either, so the check now asks only that they
+arrive where Pipecat recorded them.
+
 ## Run it
 
 Tested on Windows 10 with Python 3.13, an Intel i5-10400F and a GTX 1660 (6 GB). An NVIDIA GPU is optional but
@@ -686,7 +715,8 @@ $env:TTS = "elevenlabs"; $env:ELEVENLABS_API_KEY = [Environment]::GetEnvironment
 See the calls as traces. Download Jaeger for your platform from
 [its releases](https://github.com/jaegertracing/jaeger/releases) into `bin\jaeger\`, start it, start the bot
 with the endpoint set, make calls, and open http://localhost:16686. To run the trace check instead, stop Jaeger
-first: the check listens on the same port.
+first: the check listens on the same port. Traces leave out what was said on the call; set `TRACE_CALL_CONTENT`
+to `1` for both the bot and the check to keep it.
 
 ```powershell
 .\bin\jaeger\jaeger.exe
@@ -748,8 +778,8 @@ $env:APPOINTMENTS_DB = "fresh"
 - **Transfers need LiveKit.** On the browser client and the Twilio line the bot can only take a message.
 - **A caller on hold cannot change their mind:** their words are dropped until staff answer or the bot comes
   back, so "never mind" is not heard.
-- **Traces hold what callers said.** Pipecat's own spans record the transcripts and the messages sent to the
-  model, so names and numbers reach the trace backend; only this project's spans leave them out. A real clinic
-  would need to strip those attributes before export, or keep traces under the same rules as call recordings.
+- **Logs still hold what callers said.** Traces leave it out, but the bot's own log prints transcripts, the
+  text it speaks and tool arguments, as it always has, for debugging. A real clinic would need those logs
+  turned down or kept under the same rules as call recordings.
 - **One desk, first to accept wins.** There is no queue order, no skills routing and no transfer to a staff
   member's phone, which would need LiveKit's SIP service.

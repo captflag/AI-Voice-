@@ -8,9 +8,12 @@ LiveKit server as for evals/livekit_call.py, then the bot with tracing on, then 
 
 It runs the "connected" and "nobody" calls from evals/transfer_call.py and checks that each call is one trace:
 conversation > turn > stt, llm and tts, with the tool call inside its turn and the transfer inside the tool call.
+It also checks that nothing anyone said on the call reached the backend, while the timings and token counts did.
+Start both the bot and this script with TRACE_CALL_CONTENT=1 to check the opposite: that the switch keeps it all.
 """
 import asyncio
 import gzip
+import os
 import sys
 import time
 from collections import defaultdict
@@ -22,8 +25,12 @@ from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import ExportTrace
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import transfer_call  # noqa: E402  (same folder)
 from transfer_call import check  # noqa: E402
+import telemetry  # noqa: E402  (the project root, which transfer_call puts on the path)
 
 PHONE = "5550142237"  # transfer_call's caller never says a number, so none should reach a span either way
+KEPT = os.getenv("TRACE_CALL_CONTENT") == "1"
+# Words from the call: the caller's request, and the clinic's name from the bot's greeting and system prompt.
+SAID = ("real person", "charge on my bill", "bright smile")
 spans = []
 
 
@@ -43,7 +50,8 @@ async def receive(request):
                 spans.append({"trace": s.trace_id.hex(), "start": s.start_time_unix_nano, "id": s.span_id.hex(), "parent": s.parent_span_id.hex(),
                               "name": s.name, "ms": (s.end_time_unix_nano - s.start_time_unix_nano) / 1e6,
                               "error": s.status.code == 2, "events": [e.name for e in s.events],
-                              "attrs": {a.key: value(a.value) for a in s.attributes}})
+                              "attrs": {a.key: value(a.value) for a in s.attributes},
+                              "event_attrs": [{a.key: value(a.value) for a in e.attributes} for e in s.events]})
     return web.Response(content_type="application/x-protobuf", body=b"")
 
 
@@ -91,6 +99,19 @@ def check_trace(trace, outcome):
     mine = [s for s in trace if s["name"].startswith(("tool ", "transfer"))]
     check(not any(PHONE in str(s["attrs"]) or "summary" in s["attrs"] for s in mine),
           "the tool and transfer spans carry no caller details")
+    heard = [(s["name"], k) for s in trace for k, v in [*s["attrs"].items(),
+             *(kv for e in s["event_attrs"] for kv in e.items())] if any(w in str(v).lower() for w in SAID)]
+    if KEPT:
+        check(heard, "with TRACE_CALL_CONTENT=1, what was said is kept", "no span holds any of it")
+    else:
+        check(not heard, "no span holds anything said on the call", heard[:5])
+        extra = sorted({k for s in trace for k in s["attrs"] if not telemetry.safe({k: 1})})
+        check(not extra, "only allowlisted attributes reached the backend", extra)
+        # Not every LLM span has them: one cut off by the caller hanging up never got a timing or a token count.
+        llm = named("llm")
+        whole = [s for s in llm if {"metrics.ttfb", "gen_ai.usage.input_tokens"} <= set(s["attrs"])]
+        check(whole, f"timings and token counts are still there ({len(whole)} of {len(llm)} LLM spans have both)",
+              [sorted(s["attrs"]) for s in llm])
     return transfer[0] if transfer else None
 
 
