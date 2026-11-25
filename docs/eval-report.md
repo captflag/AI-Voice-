@@ -1,4 +1,4 @@
-# Eval report: 20261124_181953
+# Eval report: 20261125_141330
 
 13 simulated calls by voice against `bot.py`, each on a freshly started bot with an empty appointment book.
 
@@ -28,15 +28,15 @@ From the caller's last word to the bot's first, as measured by the bot itself. T
 
 | Replies | p50 | p95 | Slowest |
 |---|---|---|---|
-| 7 | 2519 ms | 4857 ms | 4857 ms |
+| 7 | 3337 ms | 4639 ms | 4639 ms |
 
 | Stage | Samples | Median | p95 |
 |---|---|---|---|
-| Speech-to-text, per segment | 33 | 396 ms | 634 ms |
-| LLM, time to first token | 48 | 560 ms | 645 ms |
-| Voice, time to first audio | 22 | 858 ms | 1049 ms |
+| Speech-to-text, per segment | 32 | 516 ms | 865 ms |
+| LLM, time to first token | 45 | 620 ms | 684 ms |
+| Voice, time to first audio | 22 | 1098 ms | 1435 ms |
 
 ## LLM cost
 
-97,231 input and 3,707 output tokens across all calls, about $0.0116 in total at Haiku 5.5 list price.
-That is $0.0009 per call, or $0.0018 per minute of call. Speech-to-text and the voice run locally, so they add hardware cost but no per-minute fee.
+96,978 input and 3,597 output tokens across all calls, about $0.0115 in total at Haiku 5.5 list price.
+That is $0.0009 per call, or $0.0015 per minute of call. Speech-to-text and the voice run locally, so they add hardware cost but no per-minute fee.

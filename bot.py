@@ -17,8 +17,10 @@ Phase 5 adds tools (tools.py): the receptionist can check free times, book and r
 appointments, and hang up when the caller is done. Phase 8 adds LiveKit, transfers to the front desk
 (transfer.py) and OpenTelemetry traces (telemetry.py).
 """
+import asyncio
 import functools
 import os
+import re
 import time
 from datetime import date
 from pathlib import Path
@@ -82,7 +84,10 @@ ort.set_default_logger_severity(3)  # errors only
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.evals.transport import EvalTransportParams
 from pipecat.audio.vad.vad_analyzer import VADParams, VADState
-from pipecat.frames.frames import LLMContextFrame, LLMRunFrame
+from pipecat.frames.frames import (BotStartedSpeakingFrame, BotStoppedSpeakingFrame, LLMContextFrame, LLMRunFrame,
+                                   TranscriptionFrame, VADUserStartedSpeakingFrame, VADUserStoppedSpeakingFrame)
+from pipecat.turns.user_start.base_user_turn_start_strategy import BaseUserTurnStartStrategy
+from pipecat.turns.user_turn_strategies import UserTurnStrategies
 from pipecat.observers.user_bot_latency_observer import UserBotLatencyObserver
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.service_switcher import ServiceSwitcher, ServiceSwitcherStrategyFailover
@@ -162,6 +167,60 @@ class LoudnessLoggingVAD(SileroVADAnalyzer):
             logger.info(f"speech ended, loudness peak {self._peak:.2f} (MIN_VOLUME {MIN_VOLUME})")
             self._peak = None
         return state
+
+
+class BackchannelAwareStart(BaseUserTurnStartStrategy):
+    """Starts the caller's turn, except that a short "mm-hmm" while the bot is talking does not interrupt it.
+
+    Replaces Pipecat's default start strategies (voice detection, with transcription as a fallback). While the
+    bot is silent, nothing changes: the turn starts the moment the voice detector hears speech. While it is
+    talking, speech has to last HOLD_SECS more before it counts as an interruption, so a quick "mm-hmm" or
+    "uh-huh" ends before then and the bot carries on. A short utterance still interrupts if its transcript holds
+    one of STOP_WORDS: a bare "stop" is short too.
+
+    Judging by length first, not by words, is deliberate: Whisper heard one "mm-hmm" as "Oh hi". And it never
+    waits for a transcript while the bot is silent; phase 4's three-words-to-interrupt rule did, and added 0.8 s
+    to every reply.
+    """
+
+    HOLD_SECS = 0.6  # after the voice detector's own 0.2 s, so speech must last about 0.8 s to interrupt
+    STOP_WORDS = re.compile(r"\b(stop|wait|hold on|hang on|sorry|excuse me|pardon|no|actually|hello)\b", re.I)
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._bot_speaking = False
+        self._pending = None  # the timer that turns long-enough speech into an interruption
+
+    async def process_frame(self, frame):
+        if isinstance(frame, BotStartedSpeakingFrame):
+            self._bot_speaking = True
+        elif isinstance(frame, BotStoppedSpeakingFrame):
+            self._bot_speaking = False
+        elif isinstance(frame, VADUserStartedSpeakingFrame):
+            if not self._bot_speaking:
+                await self.report_user_turn_started()
+            elif not self._pending:
+                self._pending = self.create_task(self._interrupt_if_still_speaking())
+        elif isinstance(frame, VADUserStoppedSpeakingFrame) and self._pending:
+            await self.cancel_task(self._pending)  # short: wait for its words
+            self._pending = None
+        elif isinstance(frame, TranscriptionFrame):
+            if self._bot_speaking and not self.STOP_WORDS.search(frame.text):
+                logger.info(f"a {len(frame.text.split())}-word sound while the bot talked; not an interruption")
+                await self.trigger_reset_aggregation()
+            else:
+                await self.report_user_turn_started()
+
+    async def _interrupt_if_still_speaking(self):
+        await asyncio.sleep(self.HOLD_SECS)
+        self._pending = None
+        await self.report_user_turn_started()
+
+    async def handle_user_turn_started(self):
+        if self._pending:
+            await self.cancel_task(self._pending)
+            self._pending = None
+        await super().handle_user_turn_started()
 
 
 class ClinicNotes(FrameProcessor):
@@ -275,7 +334,8 @@ async def bot(runner_args: RunnerArguments):
     context = LLMContext(tools=[telemetry.traced(tool) for tool in TOOLS])
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
         context,
-        user_params=LLMUserAggregatorParams(vad_analyzer=LoudnessLoggingVAD(params=VADParams(min_volume=MIN_VOLUME))),
+        user_params=LLMUserAggregatorParams(vad_analyzer=LoudnessLoggingVAD(params=VADParams(min_volume=MIN_VOLUME)),
+                                            user_turn_strategies=UserTurnStrategies(start=[BackchannelAwareStart()])),
     )
 
     # The gate's own voice detector hears a caller on hold, so a "never mind" can still be understood.

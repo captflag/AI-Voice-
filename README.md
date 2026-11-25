@@ -13,12 +13,12 @@ Everything runs locally except the LLM: speech-to-text is Whisper, the voice is 
 Silero, retrieval embeddings are BGE-small, and the model is Claude Haiku 5.5. The voice can be switched to
 ElevenLabs, with Kokoro taking over if it fails.
 
-**Latest results:** 13 of 13 simulated voice calls passed in the latest run of the suite, after phase 8's
-changes, with replies at p50 2.5 s ([docs/eval-report.md](docs/eval-report.md)); the last three-run suite
-passed 38 of 39 (the miss was a test artefact, fixed and rerun 5 of 5). 250 of 250 replies passed the
-grounding test (25 cases, ten runs each), and 19 of 19 checks passed in each round of the warm-transfer test on
-LiveKit. Details in [phase 7](#phase-7-clinic-knowledge-base) and
-[phase 8](#phase-8-handing-a-call-to-a-person).
+**Latest results:** 13 of 13 simulated voice calls passed in the latest run of the suite, in phase 9
+([docs/eval-report.md](docs/eval-report.md)); the last three-run suite passed 38 of 39 (the miss was a test
+artefact, fixed and rerun 5 of 5). 250 of 250 replies passed the grounding test (25 cases, ten runs each), and
+24 of 24 checks passed in each round of the warm-transfer test on LiveKit. Details in
+[phase 7](#phase-7-clinic-knowledge-base), [phase 8](#phase-8-handing-a-call-to-a-person) and
+[phase 9](#phase-9-hardening-for-real-calls-in-progress).
 
 ## System design
 
@@ -123,7 +123,7 @@ Each phase is one or two commits, so the history reads in the same order as this
 | 6 | Automated voice evals | p50 3.5 s, p95 4.6 s with the harness sharing the machine |
 | 7 | Clinic knowledge base, keypad entry for phone numbers | p50 3.5 s, p95 4.9 s in the eval run; retrieval adds 17 to 37 ms a turn |
 | 8 | LiveKit rooms, a warm transfer to a person at the front desk, OpenTelemetry traces, a switchable cloud voice, Plivo and Exotel phone lines | 1.6 to 2.2 s on scripted LiveKit calls |
-| 9 (in progress) | Hardening for real calls: caller details kept out of traces, a failed cloud voice skipped for a while, "never mind" on hold | unchanged |
+| 9 (in progress) | Hardening for real calls: caller details kept out of traces, a failed cloud voice skipped for a while, "never mind" on hold, "mm-hmm" no longer interrupts | unchanged by the turn-start change |
 
 "Simulated" means synthetic caller audio fed through the real pipeline with playback muted. "Live" means a
 person talking into a microphone.
@@ -660,6 +660,43 @@ is not told anything for 8 s, then says "Actually, never mind. I'll call back la
 six scenarios and 24 checks, passed **24 of 24** in each of two rounds. Across all of those calls, nothing was
 transcribed on hold except in this scenario, so the gate's detector did not pick up the hold music.
 
+**Step 4, "mm-hmm" no longer interrupts (done).** Any sound from the caller stopped the bot, including the
+"mm-hmm" and "uh-huh" people say to show they are listening. Phase 4 tried requiring three words before an
+interruption and removed it: Pipecat's rule waits for the transcript, and Whisper here transcribes after the
+caller stops talking, so every turn started late and every reply came 0.8 s later, even when the bot was
+silent.
+
+`bot.py` now starts the caller's turn with a strategy of its own, `BackchannelAwareStart`. While the bot is
+silent nothing changes: the turn starts the moment the voice detector hears speech. While it talks, speech must
+go on for 0.6 s past the detector's own 0.2 s before it counts as an interruption, so a quick "mm-hmm" is over
+first and the bot carries on. A short utterance still interrupts if its transcript has a stop word in it
+("stop", "wait", "hold on", "sorry", "no" and a few more): a bare "stop" is short too. Length decides first,
+not words, because Whisper heard one "mm-hmm" as "Oh hi".
+
+`evals/backchannel_call.py` measures it on the bot's audio over LiveKit, since the eval harness can wait for an
+event but cannot check that one never happens. During a long answer, a fresh call each time, the caller says
+one line, and the test looks for the bot going quiet:
+
+| Caller says, mid-answer | Before | After |
+|---|---|---|
+| "Mm-hmm." | bot stopped, 1.8 s after the caller began | bot carried on |
+| "Uh-huh." | bot stopped, 1.8 s | bot carried on |
+| "Wait, stop. I have a different question." | bot stopped, 1.8 s | bot stopped, 2.4 s |
+| "Stop." | bot stopped, 1.8 s | bot stopped, 2.4 to 2.5 s |
+
+Times are at the caller's end, so they include LiveKit's path and buffering both ways. The cost is 0.6 s on a
+real interruption: "Wait, stop." has pauses the detector reads as the end of speech, and "Stop." is short, so
+both wait for their transcript. The new behaviour passed 4 of 4 in each of two rounds. The voice suite passed
+13 of 13, including its own interruption scenario, which still stops the bot within the harness's 1.5 s.
+
+Replies were not slowed. The suite's p50 rose from 2.5 to 3.3 s on this run, but the turn-start parts of the
+reply did not move (endpointing 0.200 s both times, turn detection 0.053 and 0.070 s). The rise was in
+speech-to-text, 0.38 to 0.56 s, and the voice's first audio, 0.87 to 1.14 s, GPU work this change does not touch.
+
+The test had a flaw of its own at first. The scripted caller synthesised each line with Kokoro mid-call, which
+blocks it for most of a second, during which it heard nothing, so the bot seemed to go quiet the moment the
+caller spoke, whatever it did. Lines are now synthesised before the call.
+
 ## Run it
 
 Tested on Windows 10 with Python 3.13, an Intel i5-10400F and a GTX 1660 (6 GB). An NVIDIA GPU is optional but
@@ -730,6 +767,7 @@ and in a third terminal run the scripted caller:
 $env:LIVEKIT_URL = "ws://127.0.0.1:7880"; $env:LIVEKIT_API_KEY = "devkey"; $env:LIVEKIT_API_SECRET = "secret"
 .\.venv\Scripts\python bot.py -t livekit
 .\.venv\Scripts\python evals\livekit_call.py
+.\.venv\Scripts\python evals\backchannel_call.py
 ```
 
 Try a transfer. Start the staff page with the same three `LIVEKIT_` variables set, open http://localhost:7870 and
@@ -787,7 +825,7 @@ $env:APPOINTMENTS_DB = "fresh"
 | `telemetry.py` | OpenTelemetry: sends Pipecat's spans to a backend, and adds spans for tool calls and transfers |
 | `rag.py` | Retrieval: chunking, embeddings, the booking check, and attaching facts to a caller's turn |
 | `knowledge/` | The clinic's documents |
-| `evals/` | Voice scenarios and manifest, the grounding test, labelled retrieval questions, a test of the facts processor, the report script, a phone call simulator for Twilio, Plivo and Exotel, a scripted LiveKit caller, the transfer test, the trace check, the voice failover scenarios and a check of how Whisper hears the clinic's names |
+| `evals/` | Voice scenarios and manifest, the grounding test, labelled retrieval questions, a test of the facts processor, the report script, a phone call simulator for Twilio, Plivo and Exotel, a scripted LiveKit caller, the backchannel test, the transfer test, the trace check, the voice failover scenarios and a check of how Whisper hears the clinic's names |
 | `eval_services.py` | The simulated caller's voice for the eval harness |
 | `docs/` | The eval report, the editable diagrams and a Jaeger screenshot |
 
@@ -797,7 +835,9 @@ $env:APPOINTMENTS_DB = "fresh"
   real number is attached yet.
 - **The calendar is a local SQLite file,** not an external calendar service.
 - **Not deployed.** It runs on one machine with a local GPU.
-- **Any speech interrupts the bot,** including a short "mm-hm".
+- **An answer said over the bot's last words can be missed.** While the bot talks, a short sound with no stop
+  word in it is taken as "mm-hmm", so a quick "yes" said before the bot has finished its question is dropped,
+  and the caller has to say it again. A real interruption also lands 0.6 s later than before.
 - **History is trimmed to whole sentences** after an interruption, not to the exact word.
 - **Short words and names are sometimes misheard** by the small speech model, which is why the bot reads the
   name and number back before booking.

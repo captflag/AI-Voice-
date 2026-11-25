@@ -42,6 +42,15 @@ def whisper():
     return WhisperModel("base.en", device="cpu", compute_type="int8")
 
 
+@cache
+def speech(text, speaker):
+    """One line in a Kokoro voice as 16 kHz PCM. Cached: synthesis blocks the event loop for most of a second, and
+    a line synthesised mid-call stops the line hearing the bot meanwhile, which looks like the bot going quiet."""
+    samples, rate = voice().create(text, voice=speaker, speed=1.0, lang="en-us")
+    samples = np.interp(np.arange(0, len(samples), rate / RATE), np.arange(len(samples)), samples)
+    return (np.clip(samples, -1, 1) * 32767).astype(np.int16)
+
+
 def rms(samples):
     return float(np.sqrt(np.mean(samples.astype(np.float32) ** 2))) if len(samples) else 0.0
 
@@ -112,9 +121,7 @@ class Line:
 
     def say(self, text):
         """Queue one line of speech; returns the time it will have finished playing."""
-        samples, rate = voice().create(text, voice=self.speaker, speed=1.0, lang="en-us")
-        samples = np.interp(np.arange(0, len(samples), rate / RATE), np.arange(len(samples)), samples)
-        pcm = (np.clip(samples, -1, 1) * 32767).astype(np.int16)
+        pcm = speech(text, self.speaker)
         for i in range(0, len(pcm) - FRAME + 1, FRAME):
             self.speech.put_nowait(pcm[i:i + FRAME])
         return time.monotonic() + self.speech.qsize() / 100
